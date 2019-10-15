@@ -1,0 +1,44 @@
+# Copyright 2019 Google LLC
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM golang:1.13.1-alpine
+ENV GO111MODULE=on
+
+RUN apk add --no-cache protobuf
+
+WORKDIR /workdir
+
+RUN CGO_ENABLED=0 GOOS=linux go install github.com/golang/protobuf/protoc-gen-go
+
+COPY build_protos.sh .
+RUN chmod +x build_protos.sh
+
+ENTRYPOINT /workdir/build_protos.sh
+
+
+#################
+
+# FROM ubuntu
+
+# RUN mkdir /lib64 && ln -s /lib/libc.musl-x86_64.so.1 /lib64/ld-linux-x86-64.so.2
+
+# RUN apk add --no-cache curl
+# RUN apk add --no-cache unzip
+# RUN apk add --no-cache go
+# RUN apk add --no-cache git
+# WORKDIR /go/src/open-match.dev/open-match-ecosystem
+
+# RUN curl -o protoc.zip -L https://github.com/protocolbuffers/protobuf/releases/download/v3.8.0/protoc-3.8.0-linux-x86_64.zip
+# RUN unzip protoc.zip -d protoc
+#cd $(TOOLCHAIN_BIN) && $(GO) build -pkgdir . github.com/golang/protobuf/protoc-gen-go
