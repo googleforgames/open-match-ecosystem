@@ -37,7 +37,6 @@ ENV GO111MODULE=on
 #RUN protoc-gen-go --version
 #RUN exit 1
 
-
 COPY build_protos.sh .
 RUN chmod +x build_protos.sh
 
