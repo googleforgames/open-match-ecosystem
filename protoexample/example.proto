@@ -15,12 +15,10 @@
 syntax = "proto3";
 package openmatchecosystem.protoexample;
 option go_package = "open-match.dev/open-match-ecosystem/protoexample";
-// option csharp_namespace = "OpenMatch";
 
-// import "google/rpc/status.proto";
-// import "google/protobuf/struct.proto";
 import "google/protobuf/any.proto";
 
+// TODO: Remove this file after there are real protos in this repo.
 message Foo {
   string bar = 1;
   string baz = 2;

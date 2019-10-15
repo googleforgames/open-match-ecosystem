@@ -25,6 +25,7 @@ var _ = math.Inf
 // proto package needs to be updated.
 const _ = proto.ProtoPackageIsVersion3 // please upgrade the proto package
 
+// TODO: Remove this file after there are real protos in this repo.
 type Foo struct {
 	Bar                  string   `protobuf:"bytes,1,opt,name=bar,proto3" json:"bar,omitempty"`
 	Baz                  string   `protobuf:"bytes,2,opt,name=baz,proto3" json:"baz,omitempty"`
