@@ -15,9 +15,21 @@
 FROM golang:1.13.1-alpine
 ENV GO111MODULE=on
 
-RUN apk add --no-cache protobuf
-
 WORKDIR /workdir
+
+RUN apk add --no-cache curl
+RUN apk add --no-cache unzip
+RUN apk add --no-cache protobuf-dev
+
+#RUN apk add --no-cache protobuf
+#RUN apk add --no-cache libgcc
+#RUN apk add --no-cache libprotoc
+#RUN apk add --no-cache libstdc++
+#RUN apk add --no-cache musl
+
+
+#RUN curl -o protoc.zip -L https://github.com/protocolbuffers/protobuf/releases/download/v3.8.0/protoc-3.8.0-linux-x86_64.zip
+#RUN unzip protoc.zip -d protoc
 
 RUN CGO_ENABLED=0 GOOS=linux go install github.com/golang/protobuf/protoc-gen-go
 

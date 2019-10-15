@@ -1,14 +1,17 @@
+set -e
 
-echo "HI"
+echo "BUILDING PROTO FILES"
 
-pwd
+echo "MEMEME"
+# ls protoc/bin/
+echo "MEMEME"
+
 mkdir output
 
-ls mount/protoexample
-
-#protoc --help
-
-protoc mount/protoexample/*.proto \
+# ./protoc/bin/protoc mount/**/*.proto \
+protoc mount/**/*.proto \
+  -Imount/ \
+  -I/usr/include/ \
   --go_out=plugins=grpc:output
 
 ls output/open-match.dev/open-match-ecosystem
@@ -42,7 +45,7 @@ echo "THERE"
 
 #RUN cat test.sh
 
-# need build/toolchain/bin/protoc$(EXE_EXTENSION) build/toolchain/bin/protoc-gen-go$(EXE_EXTENSION) 
+# need build/toolchain/bin/protoc$(EXE_EXTENSgit ION) build/toolchain/bin/protoc-gen-go$(EXE_EXTENSION) 
 
 #  mkdir -p $(REPOSITORY_ROOT)/build/prototmp $(REPOSITORY_ROOT)/pkg/pb
 #  $(PROTOC) $< \
