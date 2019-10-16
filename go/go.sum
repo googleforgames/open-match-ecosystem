@@ -303,6 +303,4 @@ k8s.io/apimachinery v0.0.0-20190221084156-01f179d85dbc/go.mod h1:ccL7Eh7zubPUSh9
 k8s.io/client-go v9.0.0+incompatible/go.mod h1:7vJpHMYJwNQCWgzmNV+VYUl1zCObLyodBc8nIyt8L5s=
 open-match.dev/open-match v0.4.1-0.20191015212835-2aee5d128d65 h1:qbd+O0QmrHCpFV90QsWIUuw2o2eGl0Of3kzOVf6jiik=
 open-match.dev/open-match v0.4.1-0.20191015212835-2aee5d128d65/go.mod h1:UFGcqRRpJYIiBonjd6pcKfO2omN/EqXtbw1ZRE6yTJg=
-open-match.dev/open-match v0.7.0 h1:TxN+aCtqC01dy7b7LRb55Pvv9z3T7QPvRQuJ5QkGxpk=
-open-match.dev/open-match v0.7.0/go.mod h1:SiL7VCjjMe3pNJz+qIQBE8EPOg53TFzlWzpZcFtMB04=
 rsc.io/binaryregexp v0.2.0/go.mod h1:qTv7/COck+e2FymRvadv62gMdZztPaShugOCi3I+8D8=
