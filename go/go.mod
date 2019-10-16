@@ -16,4 +16,10 @@ module open-match.dev/open-match-ecosystem/go
 
 go 1.13.1
 
-require golang.org/x/net v0.0.0-20190522155817-f3200d17e092
+require (
+	github.com/golang/protobuf v1.3.2
+	github.com/sirupsen/logrus v1.4.2
+	github.com/stretchr/testify v1.3.0
+	golang.org/x/net v0.0.0-20190522155817-f3200d17e092
+	open-match.dev/open-match v0.4.1-0.20191015212835-2aee5d128d65
+)

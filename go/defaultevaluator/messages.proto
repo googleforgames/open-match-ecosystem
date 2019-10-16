@@ -1,3 +1,4 @@
+ 
 // Copyright 2019 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,18 +14,12 @@
 // limitations under the License.
 
 syntax = "proto3";
-package openmatchecosystem.protoexample;
-option go_package = "open-match.dev/open-match-ecosystem/protoexample";
+package openmatchecosystem.default_evaluator;
+option go_package = "open-match.dev/open-match-ecosystem/go/defaultevaluator";
+option csharp_namespace = "OpenMatch";
 
-import "google/protobuf/any.proto";
-
-// TODO: Remove this file after there are real protos in this repo.
-message Foo {
-  string bar = 1;
-  string baz = 2;
-  google.protobuf.Any extension = 3;
-}
-
-service Test {
-  rpc CreateFoo(Foo) returns (Foo);
+// A DefaultEvaluationCriteria is used for a match's evaluation_input when using
+// the default evaluator.
+message DefaultEvaluationCriteria {
+  double score = 1;
 }
