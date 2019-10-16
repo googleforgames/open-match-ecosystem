@@ -12,19 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-syntax = "proto3";
-package openmatchecosystem.protoexample;
-option go_package = "open-match.dev/open-match-ecosystem/protoexample";
+module open-match.dev/open-match-ecosystem/go
 
-import "google/protobuf/any.proto";
+go 1.13.1
 
-// TODO: Remove this file after there are real protos in this repo.
-message Foo {
-  string bar = 1;
-  string baz = 2;
-  google.protobuf.Any extension = 3;
-}
-
-service Test {
-  rpc CreateFoo(Foo) returns (Foo);
-}
+require (
+	github.com/golang/protobuf v1.3.2
+	github.com/sirupsen/logrus v1.4.2
+	github.com/stretchr/testify v1.3.0
+	open-match.dev/open-match v0.4.1-0.20191015212835-2aee5d128d65
+)
