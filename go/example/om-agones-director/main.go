@@ -6,17 +6,17 @@ import (
 	"io"
 	"time"
 
+	"google.golang.org/grpc"
 	"open-match.dev/open-match/pkg/pb"
 
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
 	allocationv1 "agones.dev/agones/pkg/apis/allocation/v1"
 	"agones.dev/agones/pkg/client/clientset/versioned"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/rest"
-)
 
-var cfg = getKubeConfig()
+	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+)
 
 func main() {
 	for {
@@ -26,8 +26,28 @@ func main() {
 	}
 }
 
+func createOMBackendClient() (pb.BackendClient, func() error) {
+	conn, err := grpc.Dial("om-backend.open-match.svc.cluster.local:50505", grpc.WithInsecure())
+	if err != nil {
+		panic(err)
+	}
+	return pb.NewBackendClient(conn), conn.Close
+}
+
+func createAgonesClient() *versioned.Clientset {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+	agonesClient, err := versioned.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	return agonesClient
+}
+
 // Customize the backend.FetchMatches request, the default one will return all tickets in the statestore
-func createFetchMatchesRequest() *pb.FetchMatchesRequest {
+func createOMFetchMatchesRequest() *pb.FetchMatchesRequest {
 	return &pb.FetchMatchesRequest{
 		// om-function:50502 -> the internal hostname & port number of the MMF service in our Kubernetes cluster
 		Config: &pb.FunctionConfig{
@@ -44,7 +64,7 @@ func createFetchMatchesRequest() *pb.FetchMatchesRequest {
 	}
 }
 
-func createGameServerAllocation() *allocationv1.GameServerAllocation {
+func createAgonesGameServerAllocation() *allocationv1.GameServerAllocation {
 	return &allocationv1.GameServerAllocation{
 		Spec: allocationv1.GameServerAllocationSpec{
 			Required: metav1.LabelSelector{
@@ -54,7 +74,7 @@ func createGameServerAllocation() *allocationv1.GameServerAllocation {
 	}
 }
 
-func createAssignTicketRequest(match *pb.Match, gsa *allocationv1.GameServerAllocation) *pb.AssignTicketsRequest {
+func createOMAssignTicketRequest(match *pb.Match, gsa *allocationv1.GameServerAllocation) *pb.AssignTicketsRequest {
 	tids := []string{}
 	for _, t := range match.GetTickets() {
 		tids = append(tids, t.GetId())
@@ -69,15 +89,12 @@ func createAssignTicketRequest(match *pb.Match, gsa *allocationv1.GameServerAllo
 }
 
 func run() error {
-	bc, closer := getOMBackendClient(cfg)
+	bc, closer := createOMBackendClient()
 	defer closer()
 
-	agonesClient, err := versioned.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
+	agonesClient := createAgonesClient()
 
-	stream, err := bc.FetchMatches(context.Background(), createFetchMatchesRequest())
+	stream, err := bc.FetchMatches(context.Background(), createOMFetchMatchesRequest())
 	if err != nil {
 		fmt.Printf("Director: fail to get response stream from backend.FetchMatches call, desc: %s\n", err.Error())
 		return err
@@ -93,7 +110,7 @@ func run() error {
 			return err
 		}
 
-		gsa, err := agonesClient.AllocationV1().GameServerAllocations("default").Create(createGameServerAllocation())
+		gsa, err := agonesClient.AllocationV1().GameServerAllocations("default").Create(createAgonesGameServerAllocation())
 		if err != nil {
 			return err
 		}
@@ -102,9 +119,9 @@ func run() error {
 			continue
 		}
 
-		if _, err = bc.AssignTickets(context.Background(), createAssignTicketRequest(resp.GetMatch(), gsa)); err != nil {
+		if _, err = bc.AssignTickets(context.Background(), createOMAssignTicketRequest(resp.GetMatch(), gsa)); err != nil {
 			// Corner case where we allocated a game server for players who left the queue after some waiting time.
-			// Note that we may still leak some game servers when tickets got assigned but players leave the queue before game frontend announced the assignments.
+			// Note that we may still leak some game servers when tickets got assigned but players left the queue before game frontend announced the assignments.
 			if err = agonesClient.AgonesV1().GameServers("default").Delete(gsa.Status.GameServerName, &metav1.DeleteOptions{}); err != nil {
 				return err
 			}
@@ -114,9 +131,4 @@ func run() error {
 
 	time.Sleep(time.Second * 5)
 	return nil
-}
-
-func getOMBackendClient(cfg *rest.Config) (pb.BackendClient, func() error) {
-	conn := getGRPCConnFromSvcName(cfg, "om-backend")
-	return pb.NewBackendClient(conn), conn.Close
 }
