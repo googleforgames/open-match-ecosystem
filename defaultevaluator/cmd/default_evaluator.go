@@ -19,7 +19,7 @@ import (
 
 	"github.com/golang/protobuf/ptypes"
 	"github.com/sirupsen/logrus"
-	"open-match.dev/open-match-ecosystem/go/defaultevaluator"
+	"open-match.dev/open-match-ecosystem/defaultevaluator"
 	harness "open-match.dev/open-match/pkg/harness/evaluator/golang"
 	"open-match.dev/open-match/pkg/pb"
 )
