@@ -15,7 +15,7 @@
 
 syntax = "proto3";
 package openmatchecosystem.default_evaluator;
-option go_package = "open-match.dev/open-match-ecosystem/go/defaultevaluator";
+option go_package = "open-match.dev/open-match-ecosystem/defaultevaluator";
 option csharp_namespace = "OpenMatch";
 
 // A DefaultEvaluationCriteria is used for a match's evaluation_input when using
