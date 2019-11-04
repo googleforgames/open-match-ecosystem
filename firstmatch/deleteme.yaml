@@ -1,0 +1,46 @@
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: testing
+# ---
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: test
+#   namespace: testing
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: test
+#       component: demo
+#   template:
+#     metadata:
+#       namespace: testing
+#       labels:
+#         app: test
+#         component: demo
+#     spec:
+#       volumes:
+#         - name: test-mount
+#           configMap:
+#             name: test-configmap
+#       containers:
+#       - name: test
+#         image: nginx:1.7.9
+#         imagePullPolicy: Always
+#         volumeMounts:
+#           - name: test-mount
+#             mountPath: /app/config/default
+
+
+# ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-configmap
+  namespace: testing
+data:
+  matchmaker_config_override.yaml: |-
+    logging:
+      level: debug
