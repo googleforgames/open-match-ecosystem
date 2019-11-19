@@ -66,3 +66,23 @@ spec:
         ports:
         - name: http
           containerPort: 51507
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: om-configmap-override
+  namespace: open-match
+  labels:
+    app: open-match
+    component: config
+    release: open-match
+data:
+  matchmaker_config_override.yaml: |-
+    api:
+      evaluator:
+        hostname: "om-evaluator"
+        grpcport: "50508"
+    synchronizer:
+      enabled: true
+      registrationIntervalMs: 250ms
+      proposalCollectionIntervalMs: 500ms

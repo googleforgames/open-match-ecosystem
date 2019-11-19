@@ -77,22 +77,9 @@ spec:
         component: evaluator
         release: open-match
     spec:
-      volumes:
-        - name: customize-config-volume
-          configMap:
-            name: customize-configmap
-        - name: global-config-volume
-          configMap:
-            name: global-configmap
 
       containers:
       - name: om-evaluator
-        volumeMounts:
-
-          - name: customize-config-volume
-            mountPath: /app/config/om
-          - name: global-config-volume
-            mountPath: /app/config/global
 
         image: needToOverrideImageWithRealImageName
         ports:
