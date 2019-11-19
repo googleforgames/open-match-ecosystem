@@ -22,7 +22,6 @@ import (
 	"github.com/golang/protobuf/ptypes/any"
 	"github.com/stretchr/testify/assert"
 	"open-match.dev/open-match-ecosystem/defaultevaluator"
-	harness "open-match.dev/open-match/pkg/harness/evaluator/golang"
 	"open-match.dev/open-match/pkg/pb"
 )
 
@@ -41,30 +40,38 @@ func TestEvaluate(t *testing.T) {
 
 	ticket12Score1 := &pb.Match{
 		Tickets: []*pb.Ticket{ticket1, ticket2},
-		EvaluationInput: mustAny(&defaultevaluator.DefaultEvaluationCriteria{
-			Score: 1,
-		}),
+		Extensions: map[string]*any.Any{
+			"evaluation_input": mustAny(&defaultevaluator.DefaultEvaluationCriteria{
+				Score: 1,
+			}),
+		},
 	}
 
 	ticket12Score10 := &pb.Match{
 		Tickets: []*pb.Ticket{ticket2, ticket1},
-		EvaluationInput: mustAny(&defaultevaluator.DefaultEvaluationCriteria{
-			Score: 10,
-		}),
+		Extensions: map[string]*any.Any{
+			"evaluation_input": mustAny(&defaultevaluator.DefaultEvaluationCriteria{
+				Score: 10,
+			}),
+		},
 	}
 
 	ticket123Score5 := &pb.Match{
 		Tickets: []*pb.Ticket{ticket1, ticket2, ticket3},
-		EvaluationInput: mustAny(&defaultevaluator.DefaultEvaluationCriteria{
-			Score: 5,
-		}),
+		Extensions: map[string]*any.Any{
+			"evaluation_input": mustAny(&defaultevaluator.DefaultEvaluationCriteria{
+				Score: 5,
+			}),
+		},
 	}
 
 	ticket3Score50 := &pb.Match{
 		Tickets: []*pb.Ticket{ticket3},
-		EvaluationInput: mustAny(&defaultevaluator.DefaultEvaluationCriteria{
-			Score: 50,
-		}),
+		Extensions: map[string]*any.Any{
+			"evaluation_input": mustAny(&defaultevaluator.DefaultEvaluationCriteria{
+				Score: 50,
+			}),
+		},
 	}
 
 	tests := []struct {
@@ -103,7 +110,7 @@ func TestEvaluate(t *testing.T) {
 		test := test
 		t.Run(test.description, func(t *testing.T) {
 			t.Parallel()
-			gotMatches, err := evaluate(&harness.EvaluatorParams{Matches: test.testMatches})
+			gotMatches, err := evaluate(test.testMatches)
 
 			assert.Nil(t, err)
 			assert.Equal(t, len(test.wantMatches), len(gotMatches))
