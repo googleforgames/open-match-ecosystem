@@ -2,7 +2,7 @@ To deploy:
 
 1. Deploy and configure core open-match:
 ```
-kubectl apply -f https://open-match.dev/install/v0.8.0/yaml/01-open-match-core.yaml -f coreconfig.yaml --namespace=open-match
+kubectl apply -f https://open-match.dev/install/v0.8.0/yaml/01-open-match-core.yaml --namespace=open-match
 
 ```
 
