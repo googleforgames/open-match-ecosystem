@@ -34,7 +34,7 @@ spec:
   - name: http
     protocol: TCP
     port: 51507
-  - name: mmf-grcp
+  - name: mmf-grpc
     protocol: TCP
     port: 50502
 ---

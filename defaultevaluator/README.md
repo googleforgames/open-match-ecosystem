@@ -11,3 +11,4 @@ kubectl apply -f defaultevaluator.yaml && \
 kubectl set image --namespace open-match deployment/om-evaluator om-evaluator=$IMAGE_TAG
 
 ```
+

@@ -24,3 +24,5 @@ sleep 5 && \
 kubectl port-forward --namespace open-match-firstmatch service/om-demo 51507:51507
 
 ```
+
+4. The live working demo is now available at: localhost:51507.
