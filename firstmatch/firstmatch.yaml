@@ -1,0 +1,88 @@
+# Copyright 2019 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: open-match-firstmatch
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: om-demo
+  namespace: open-match-firstmatch
+  labels:
+    app: open-match-firstmatch
+    component: demo
+spec:
+  selector:
+    app: open-match-firstmatch
+    component: demo
+  type: ClusterIP
+  ports:
+  - name: http
+    protocol: TCP
+    port: 51507
+  - name: mmf-grpc
+    protocol: TCP
+    port: 50502
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: om-demo
+  namespace: open-match-firstmatch
+  labels:
+    app: open-match-firstmatch
+    component: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: open-match-firstmatch
+      component: demo
+  template:
+    metadata:
+      namespace: open-match-firstmatch
+      labels:
+        app: open-match-firstmatch
+        component: demo
+    spec:
+      containers:
+      - name: om-demo-firstmatch
+        image: needToOverrideImageWithRealImageName
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 51507
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: om-configmap-override
+  namespace: open-match
+  labels:
+    app: open-match
+    component: config
+    release: open-match
+data:
+  matchmaker_config_override.yaml: |-
+    api:
+      evaluator:
+        hostname: "om-evaluator"
+        grpcport: "50508"
+    synchronizer:
+      enabled: true
+      registrationIntervalMs: 250ms
+      proposalCollectionIntervalMs: 500ms
