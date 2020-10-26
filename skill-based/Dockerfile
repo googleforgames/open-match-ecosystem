@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM open-match-base-build as builder
+FROM golang:1.15.2 as builder
 
-WORKDIR /go/src/open-match.dev/open-match/examples/functions/golang/skill-based
+WORKDIR /go/src/open-match.dev/open-match-ecosystem/skill-based
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o matchfunction .
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /app/
-COPY --from=builder --chown=nonroot /go/src/open-match.dev/open-match/examples/functions/golang/skill-based/matchfunction /app/
+COPY --from=builder --chown=nonroot /go/src/open-match.dev/open-match-ecosystem/skill-based/matchfunction /app/
 
 ENTRYPOINT ["/app/matchfunction"]
