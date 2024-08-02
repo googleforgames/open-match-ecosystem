@@ -34,7 +34,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	mmf "open-match.dev/open-match-ecosystem/v2/functions/soloduel"
+	mmf "open-match.dev/open-match-ecosystem/v2/mmf/functions/soloduel"
 	"open-match.dev/open-match-ecosystem/v2/mmf/server"
 )
 
