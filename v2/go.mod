@@ -1,6 +1,6 @@
 module open-match.dev/open-match-ecosystem/v2
 
-go 1.23
+go 1.22.5
 
 require (
 	github.com/googleforgames/open-match2/v2 v2.0.2
