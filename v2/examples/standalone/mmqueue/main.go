@@ -1,0 +1,154 @@
+// Copyright 2024 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// This example is part of one approach to writing a matchmaker using Open
+// Match v2.x. Many approaches are viable, and we encourage you to read the
+// documentation at open-match.dev for more ideas and patterns.
+//
+// Minimally, a matchmaker using open-match is expected to:
+// 1) queue player matchmaking requests,
+// 2) request matches and distribute them to servers,
+// 3) notify players of their match assignments,
+// 4) and provide custom matchmaking logic.
+// These components can be one in the same, or have their duties federated
+// across a number of platform services. Regardless of the pattern used, the
+// collection of the above functionality is referred to by Open Match v2.x as
+// your 'matchmaker'.
+//
+// NOTE: This example does not use om-core for assignments as this
+// functionality is deprecated. It is recommended you use a player status
+// service for storing and retrieving player assignments in production
+// environments.
+//
+// This file mocks a component of a matchmaker that receives player matchmaking
+// requests and creates tickets in Open Match (#1 above). A typical approach is
+// a horizontally-scalable server process with:
+// - an endpoint the client hits when it wants to begin matchmaking that does
+//   some or all of these things:
+//   - Generate a Open Match Ticket protobuf message containing the game
+//     client-provided matching attributes (e.g. ping values, game mode and
+//     character selections)
+//   - Add additional data useful for matchmaking from your own authoritative
+//     systems as necessary (e.g. MMR values, character progression, purchased
+//     unlocks)
+//   - Queues this ticket for creation in Open Match. This is a
+//     production best practice and allows you to manage ticket pressure in Open
+//     Match during spikes in demand (launch, immediately after a maintenance
+//     window, after unexpected downtime, etc.)
+// - An asynchronous loop to process queued tickets, handling these tasks:
+//   - Creates queued tickets in Open Match (POST /tickets -> receive TicketID in
+//     response). These TicketIDs need to be activated before they are available
+//     for matching.
+//   - Stores the ClientID to TicketID mapping. This mapping can be kept local
+//     to this process (not scalable, not persistent, not highly available), but
+//     it is recommended that it is stored in a player status service instead.
+//   - POST batches of TicketIDs to the /tickeds:activate endpoint to mark those
+//     tickets as available for matching.
+//
+
+package main
+
+import (
+	"context"
+	"net/http"
+	_ "net/http"
+	_ "net/http/pprof"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/spf13/viper"
+
+	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
+	// 'well-known types' https://github.com/golang/protobuf/issues/1156
+	_ "google.golang.org/protobuf/types/known/wrapperspb"
+	//soloduelServer "open-match.dev/functions/golang/soloduel"
+	//mmf "open-match.dev/mmf/server"
+	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/internal/logging"
+	"open-match.dev/open-match-ecosystem/v2/internal/mmqueue"
+	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
+)
+
+func main() {
+
+	// Quit this process on the signals sent by kubernetes/knative/Cloud Run/ctrl+c.
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Read config
+	cfg := viper.New()
+	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
+	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
+	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 20)
+	cfg.SetDefault("PORT", 8081)
+	cfg.AutomaticEnv()
+
+	// initialize shared structured logging
+	logger := logging.NewSharedLogger(cfg)
+
+	// Initialize the queue
+	q := &mmqueue.MatchmakerQueue{
+		OmClient: &omclient.RestfulOMGrpcClient{
+			Client: &http.Client{},
+			Log:    logger,
+			Cfg:    cfg,
+		},
+		Cfg:               cfg,
+		Log:               logger,
+		ClientRequestChan: make(chan *mmqueue.ClientRequest),
+	}
+	// Start the queue. This is where requests are processed and added to Open Match.
+	go q.Run(ctx)
+
+	// Handler for client matchmaking requests
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+
+		// Make a channel on which the queue will return its http.Status result
+		resultChan := make(chan int)
+		q.ClientRequestChan <- &mmqueue.ClientRequest{
+			ResultChan: resultChan,
+			Ticket: func(r *http.Request) *pb.Ticket {
+				// In a real game client, you'd probably use whatever communication
+				// protocol/format (JSON string, binary encoding, a custom format,
+				// etc) your game engine or dev kit encourages, and parse that data
+				// from the http.Request into the Open Match protobuf `ticket`
+				// protobuf here.
+				return &pb.Ticket{}
+			}(r),
+		}
+
+		// Write the http.Status code returned by the queue
+		w.WriteHeader(<-resultChan)
+	})
+
+	// Start http server.
+	logger.Infof("PORT %v detected", cfg.GetString("PORT"))
+	srv := &http.Server{Addr: ":" + cfg.GetString("PORT")}
+	go func() {
+		// ErrServerClosed is the error returned by http.Server on graceful exit.
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			logger.Fatal(err)
+		}
+	}()
+
+	// Wait for quit signal
+	<-signalChan
+	if err := srv.Shutdown(ctx); err != nil {
+		logger.Fatal(err)
+	}
+	logger.Info("Exiting...")
+}
