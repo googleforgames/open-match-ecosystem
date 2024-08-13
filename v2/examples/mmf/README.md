@@ -1,4 +1,4 @@
-# Development
+# OM2 Matchmaking Function (MMF) Sample
 
 This Open Match 2 sample MMF is intended as a starting point for your development of custom matching logic for Open Match 2. You are expected to adapt the logic in the `functions/soloduel/soloduel.go:Run()` function to suit your game's needs. 
 
