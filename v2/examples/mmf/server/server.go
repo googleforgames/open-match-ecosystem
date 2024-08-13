@@ -68,10 +68,10 @@ func StartServer(port int32, mmfServer pb.MatchMakingFunctionServiceServer, l *l
 	return err
 }
 
-// GetChunkedRequest is a function that receives a MMF Server request stream and
-// re-assembles the profile in that request.  Profiles are 'chunked' when the profile
-// contains enough participating tickets in it's pools that it is larger than the 4MB
-// default max size of a single  protobuf message. Each 'chunk' contains the complete
+// GetChunkedRequest receives a MMF Server request stream sending partial
+// 'chunks' of a profile and re-assembles it. A profiles is 'chunked' when it
+// its pools contain enough participating tickets that it exceeds the 4MB
+// default max size of a protobuf message. Each 'chunk' contains the complete
 // profile and a portion of the tickets participating in the profile's pools.
 func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Profile, error) {
 	// Infinite loop that breaks on stream close (err == io.EOF) or after receiving

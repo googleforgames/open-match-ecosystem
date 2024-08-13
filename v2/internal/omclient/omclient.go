@@ -264,6 +264,8 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 }
 
 func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, reqPb *pb.MmfRequest, respChan chan *pb.StreamedMmfResponse) {
+	// Make sure the output channel always gets closed when this function is finished.
+	defer close(respChan)
 
 	// Have to cancel the context to tell the om-core server we're done reading from the stream.
 	ctx, cancel := context.WithCancel(ctx)

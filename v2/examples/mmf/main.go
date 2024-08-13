@@ -29,50 +29,29 @@
 package main
 
 import (
-	"os"
-	"strconv"
-	"time"
-
-	"github.com/sirupsen/logrus"
-	mmf "open-match.dev/open-match-ecosystem/v2/mmf/functions/soloduel"
-	"open-match.dev/open-match-ecosystem/v2/mmf/server"
-)
-
-var (
-	jsonFormatter = &logrus.JSONFormatter{
-		FieldMap: logrus.FieldMap{
-			logrus.FieldKeyTime:  "timestamp",
-			logrus.FieldKeyLevel: "severity",
-			logrus.FieldKeyMsg:   "message",
-		},
-		TimestampFormat: time.RFC3339Nano,
-	}
-	log = &logrus.Logger{
-		Out:          os.Stdout,
-		Formatter:    jsonFormatter,
-		Level:        logrus.InfoLevel,
-		ReportCaller: false,
-	}
+	"github.com/spf13/viper"
+	mmf "open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/soloduel"
+	"open-match.dev/open-match-ecosystem/v2/examples/mmf/server"
+	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 )
 
 func main() {
-	var port int
 
-	// Check the knative/Cloud Run auto-populated env var for our port binding
-	// Default to 8081
-	{
-		var ok bool
-		var runPort string
-		var err error
+	// Init viper config with default port
+	cfg := viper.New()
+	cfg.SetDefault("PORT", 8080)
+	cfg.AutomaticEnv()
 
-		if runPort, ok = os.LookupEnv("PORT"); ok {
-			port, err = strconv.Atoi(runPort)
-		}
-		if err != nil || !ok {
-			port = 8081
-		}
-	}
+	// Uncomment these options for logging more suitable to local development
+	//cfg.SetDefault("LOGGING_FORMAT", "text")
+	//cfg.SetDefault("LOGGING_LEVEL", "debug")
+	//cfg.SetDefault("LOG_CALLER", "true")
 
-	mmfFifo := mmf.New()
-	server.StartServer(int32(port), mmfFifo, log)
+	// Initialize logging
+	logger := logging.NewSharedLogger(cfg)
+
+	customMatchingLogic := mmf.NewWithLogger(logger)
+
+	// Start a gRPC server that handles MMF requests
+	server.StartServer(cfg.GetInt32("PORT"), customMatchingLogic, logger)
 }
