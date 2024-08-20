@@ -31,7 +31,6 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/idtoken"
@@ -58,7 +57,7 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 	defer cancel()
 
 	logger := rc.Log.WithFields(logrus.Fields{
-		"component": "mock_frontend",
+		"component": "open_match_client",
 		"operation": "proxy_CreateTicket",
 	})
 
@@ -83,7 +82,7 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 	}
 
 	// HTTP version of the gRPC CreateTicket() call
-	resp, err := rc.Post(ctx, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets", buf)
+	resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets", buf)
 
 	// Include headers in structured loggerging when debugging.
 	headerFields := logrus.Fields{}
@@ -153,6 +152,12 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 // open-match.dev/core/internal/config for limits on how many actions you can
 // request in a single API call, this needs to use the same value)
 func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToActivate chan string) {
+
+	logger := rc.Log.WithFields(logrus.Fields{
+		"component": "open_match_client",
+		"operation": "proxy_ActivateTickets",
+	})
+
 	// Activate all new tickets
 	done := false
 	ticketsAwaitingActivation := make([]string, 0)
@@ -178,7 +183,7 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 
 		// We've got tickets to activate
 		if len(ticketsAwaitingActivation) > 0 {
-			log.Debugf("ActivateTicket call with %v tickets: %v...", len(ticketsAwaitingActivation), ticketsAwaitingActivation[0])
+			logger.Debugf("ActivateTicket call with %v tickets: %v...", len(ticketsAwaitingActivation), ticketsAwaitingActivation[0])
 			if len(ticketsAwaitingActivation) == rc.Cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL") {
 				done = false
 			}
@@ -193,7 +198,7 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 				callerFromContext := func() string {
 					ts, ok := ctx.Value("type").(string)
 					if !ok {
-						log.Error("unable to get caller type from context")
+						logger.Error("unable to get caller type from context")
 						return "undefined"
 					}
 					return ts
@@ -210,7 +215,7 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 				// Marshal request into json
 				req, err := protojson.Marshal(reqPb)
 				if err != nil {
-					log.WithFields(logrus.Fields{
+					logger.WithFields(logrus.Fields{
 						"caller":     callerFromContext,
 						"pb_message": "ActivateTicketsRequest",
 					}).Errorf("cannot marshal protobuf to json")
@@ -218,19 +223,19 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 
 				// HTTP version of the gRPC ActivateTickets() call that we want to retry with exponential backoff and jitter
 				activateTicketCall := func() error {
-					log.Tracef("!! %v Tix awaiting activation", len(ticketsAwaitingActivation))
-					resp, err := rc.Post(ctx, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets:activate", req)
+					logger.Tracef("!! %v Tix awaiting activation", len(ticketsAwaitingActivation))
+					resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets:activate", req)
 					// TODO: In reality, the error has details fields, telling us which ticket couldn't
 					// be activated, but we're not processing those or passing them on yet, we just act as
 					// though it is all-or-nothing.
 					if err != nil {
-						log.WithFields(logrus.Fields{
+						logger.WithFields(logrus.Fields{
 							"caller": callerFromContext,
 						}).Errorf("ActivateTickets attempt failed: %w", err)
 
 						return err
 					} else if resp != nil && resp.StatusCode != http.StatusOK { // HTTP error code
-						log.WithFields(logrus.Fields{
+						logger.WithFields(logrus.Fields{
 							"caller": callerFromContext,
 						}).Errorf("ActivateTickets attempt failed: %w", fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode))
 						return fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
@@ -244,14 +249,14 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 					backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)),
 					func(err error, bo time.Duration) {
 						// The function that gets called to notify us when there's an activateTicketCall failure, before it is retried.
-						log.Errorf("ActivateTicket temporary failure (backoff for %v): %v", err, bo)
+						logger.Errorf("ActivateTicket temporary failure (backoff for %v): %v", err, bo)
 					})
 				if err != nil {
-					log.WithFields(logrus.Fields{
+					logger.WithFields(logrus.Fields{
 						"caller": callerFromContext,
 					}).Errorf("ActivateTickets failed: %w", err)
 				}
-				log.WithFields(logrus.Fields{
+				logger.WithFields(logrus.Fields{
 					"caller": callerFromContext,
 				}).Debug("ActivateTickets complete")
 			}(ticketsAwaitingActivation)
@@ -267,6 +272,11 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	// Make sure the output channel always gets closed when this function is finished.
 	defer close(respChan)
 
+	logger := rc.Log.WithFields(logrus.Fields{
+		"component": "open_match_client",
+		"operation": "proxy_InvokeMatchmakingFunctions",
+	})
+
 	// Have to cancel the context to tell the om-core server we're done reading from the stream.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -274,24 +284,24 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	// Marshal protobuf request to JSON for grpc-gateway HTTP call
 	req, err := protojson.Marshal(reqPb)
 	if err != nil {
-		log.WithFields(logrus.Fields{
+		logger.WithFields(logrus.Fields{
 			"pb_message": "MmfRequest",
 		}).Errorf("cannot marshal protobuf to json")
 	} else {
-		log.Debug("Marshalled MmfRequest protobuf message to JSON")
+		logger.Debug("Marshalled MmfRequest protobuf message to JSON")
 	}
 
 	// HTTP version of gRPC InvokeMatchmakingFunctions() call
-	log.Debug("Invokingmmfs")
-	resp, err := rc.Post(ctx, rc.Cfg.GetString("OM_CORE_ADDR"), "/matches:fetch", req)
+	logger.Debug("Invokingmmfs")
+	resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/matches:fetch", req)
 	if err != nil {
-		log.Errorf("InvokeMatchmakingFunction call failed: %v", err)
+		logger.Errorf("InvokeMatchmakingFunction call failed: %v", err)
 	} else {
-		log.Tracef("InvokeMatchmakingFunction call successful: %v", resp.StatusCode)
+		logger.Tracef("InvokeMatchmakingFunction call successful: %v", resp.StatusCode)
 
 		// Check for a successful HTTP status code
 		if resp.StatusCode != http.StatusOK {
-			log.Fatalf("Request failed with status: %s", resp.Status)
+			logger.Fatalf("Request failed with status: %s", resp.Status)
 		}
 
 		// Process the result stream
@@ -306,7 +316,7 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 				break // End of stream; done!
 			}
 			if err != nil {
-				log.Errorf("Error reading stream, closing: %v", err)
+				logger.Errorf("Error reading stream, closing: %v", err)
 				break
 			}
 
@@ -317,7 +327,7 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 			// marshal the text to json (which is slow), we just use
 			// string trimming functions.
 			trimmedMsg := strings.TrimSuffix(strings.TrimPrefix(msg, `{"result":`), "}")
-			log.WithFields(logrus.Fields{
+			logger.WithFields(logrus.Fields{
 				"pb_message": "StreamedMmfResponse",
 			}).Tracef("HTTP response JSON body version of StreamedMmfResponse received")
 
@@ -325,23 +335,23 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 			resPb = &pb.StreamedMmfResponse{}
 			err = protojson.Unmarshal([]byte(trimmedMsg), resPb)
 			if err != nil {
-				log.WithFields(logrus.Fields{
+				logger.WithFields(logrus.Fields{
 					"pb_message":    "StreamedMmfResponse",
 					"http_response": trimmedMsg,
 					"error":         err,
 				}).Errorf("cannot unmarshal http response body back into protobuf")
 				continue
 			} else {
-				log.Trace("Successfully unmarshalled HTTP response JSON body back into StreamedMmfResponse protobuf message")
+				logger.Trace("Successfully unmarshalled HTTP response JSON body back into StreamedMmfResponse protobuf message")
 			}
 
 			if resPb == nil {
-				log.Trace("StreamedMmfResponse protobuf was nil!")
+				logger.Trace("StreamedMmfResponse protobuf was nil!")
 				continue // Loop again to get the next streamed response
 			}
 
 			// Send back the streamed responses as we get them
-			log.Trace("StreamedMmfResponse protobuf exists")
+			logger.Trace("StreamedMmfResponse protobuf exists")
 			respChan <- resPb
 
 		}
@@ -355,9 +365,9 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 // provided protobuf in the pbReq argument into the HTTP request JSON body (for
 // use with grpc gateway). It attempts to transparently handle TLS if the target
 // server requires it.
-func (rc *RestfulOMGrpcClient) Post(ctx context.Context, url string, path string, reqBuf []byte) (*http.Response, error) {
+func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, url string, path string, reqBuf []byte) (*http.Response, error) {
 	// Add the url as a structured logging field when debug logging is enabled
-	logger := rc.Log.WithFields(logrus.Fields{
+	postLogger := logger.WithFields(logrus.Fields{
 		"url": url + path,
 	})
 
@@ -369,12 +379,12 @@ func (rc *RestfulOMGrpcClient) Post(ctx context.Context, url string, path string
 		bytes.NewReader(reqBuf), // JSON-marshalled protobuf request message
 	)
 	if err != nil {
-		logger.Errorf("cannot create http request with context")
+		postLogger.Errorf("cannot create http request with context")
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	logger.Trace("Header set, request created")
+	postLogger.Trace("Header set, request created")
 
 	if os.Getenv("K_REVISION") != "" { // Running on Cloud Run, get GCP SA token
 		if rc.tokenSource == nil {
@@ -399,13 +409,13 @@ func (rc *RestfulOMGrpcClient) Post(ctx context.Context, url string, path string
 		for key, value := range req.Header {
 			headerFields[key] = value
 		}
-		logger.WithFields(headerFields).Debug("Prepared Headers")
+		postLogger.WithFields(headerFields).Debug("Prepared Headers")
 	}
 
 	// Send request
 	resp, err := rc.Client.Do(req)
 	if err != nil {
-		logger.WithFields(logrus.Fields{
+		postLogger.WithFields(logrus.Fields{
 			"error": err,
 		}).Error("cannot execute http request")
 		return nil, err

@@ -66,13 +66,18 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
+
 	//soloduelServer "open-match.dev/functions/golang/soloduel"
 	//mmf "open-match.dev/mmf/server"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
@@ -95,22 +100,47 @@ func main() {
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 20)
 	cfg.SetDefault("PORT", 8081)
+
+	// Override these with env vars when doing local development.
+	// Suggested values in that case are "text", "debug", and "false",
+	// respectively
+	cfg.SetDefault("LOGGING_FORMAT", "json")
+	cfg.SetDefault("LOGGING_LEVEL", "info")
+	cfg.SetDefault("LOG_CALLER", "false")
+
+	// Read overrides from env vars
 	cfg.AutomaticEnv()
 
 	// initialize shared structured logging
-	logger := logging.NewSharedLogger(cfg)
+	log := logging.NewSharedLogger(cfg)
+	logger := log.WithFields(logrus.Fields{"component": "matchmaking_queue"})
 
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
 		OmClient: &omclient.RestfulOMGrpcClient{
 			Client: &http.Client{},
-			Log:    logger,
+			Log:    log,
 			Cfg:    cfg,
 		},
 		Cfg:               cfg,
-		Log:               logger,
+		Log:               log,
 		ClientRequestChan: make(chan *mmqueue.ClientRequest),
 	}
+
+	// TODO: move this into the omclient
+	//Check connection before spinning everything up.
+	buf, err := protojson.Marshal(&pb.CreateTicketRequest{
+		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()}, // Dummy ticket
+	})
+	_, err = q.OmClient.Post(ctx, cfg.GetString("OM_CORE_ADDR"), "/", buf)
+	if err != nil {
+		logger.Errorf("OM Connection test failure: %v", err)
+		if strings.Contains(err.Error(), "connect: connection refused") {
+			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
+			os.Exit(1)
+		}
+	}
+
 	// Start the queue. This is where requests are processed and added to Open Match.
 	go q.Run(ctx)
 
@@ -127,6 +157,13 @@ func main() {
 				// etc) your game engine or dev kit encourages, and parse that data
 				// from the http.Request into the Open Match protobuf `ticket`
 				// protobuf here.
+				//
+				// This example just makes an empty ticket.
+				//
+				// This ticket can only appear in Pools with a single
+				// CreationTimeFilter, as they have no other attributes to
+				// match against (CreationTime is created by Open Match upon
+				// ticket creation).
 				return &pb.Ticket{}
 			}(r),
 		}
