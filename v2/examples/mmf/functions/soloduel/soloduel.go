@@ -107,7 +107,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		}
 		s.logger.Debugf("Found %v tickets in pool %v", len(tickets), pname)
 	}
-	s.logger.Debugf("Matching among %v tickets from all provided pools", len(tickets))
+	s.logger.Debugf("Matching among %v tickets from %v provided pools", len(tickets), len(req.GetPools()))
 
 	t := time.Now().Format("2006-01-02T15:04:05.00")
 
