@@ -42,10 +42,12 @@ func main() {
 	cfg.SetDefault("PORT", 8080)
 	cfg.AutomaticEnv()
 
-	// Uncomment these options for logging more suitable to local development
-	//cfg.SetDefault("LOGGING_FORMAT", "text")
-	//cfg.SetDefault("LOGGING_LEVEL", "debug")
-	//cfg.SetDefault("LOG_CALLER", "true")
+	// Override these with env vars when doing local development.
+	// Suggested values in that case are "text", "debug", and "false",
+	// respectively
+	cfg.SetDefault("LOGGING_FORMAT", "json")
+	cfg.SetDefault("LOGGING_LEVEL", "info")
+	cfg.SetDefault("LOG_CALLER", "false")
 
 	// Initialize logging
 	logger := logging.NewSharedLogger(cfg)
