@@ -83,6 +83,7 @@ import (
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 	"open-match.dev/open-match-ecosystem/v2/internal/mmqueue"
+	"open-match.dev/open-match-ecosystem/v2/internal/mocks/gameclient"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
@@ -132,7 +133,7 @@ func main() {
 	buf, err := protojson.Marshal(&pb.CreateTicketRequest{
 		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()}, // Dummy ticket
 	})
-	_, err = q.OmClient.Post(ctx, cfg.GetString("OM_CORE_ADDR"), "/", buf)
+	_, err = q.OmClient.Post(ctx, logger, cfg.GetString("OM_CORE_ADDR"), "/", buf)
 	if err != nil {
 		logger.Errorf("OM Connection test failure: %v", err)
 		if strings.Contains(err.Error(), "connect: connection refused") {
@@ -164,7 +165,10 @@ func main() {
 				// CreationTimeFilter, as they have no other attributes to
 				// match against (CreationTime is created by Open Match upon
 				// ticket creation).
-				return &pb.Ticket{}
+				ticket := &pb.Ticket{}
+				// TODO: remove this line once the test framework is trued up
+				ticket = gameclient.Simple(ctx)
+				return ticket
 			}(r),
 		}
 

@@ -14,14 +14,14 @@
 
 // This sample is a reference to demonstrate serving a golang matchmaking
 // function using gRPC, and can be used as a starting point for your match
-// function.  This sample uses the 'soloduel' matching function to create 1v1
+// function.  This sample uses the 'fifo' matching function to create 1v1
 // matches, using a first-in-first-out (FIFO) strategy.
 //
 // A typical approach if you wish to write your mmf in golang would be to make
-// a copy of the open-match.dev/open-match-ecosystem/v2/mmf/functions/soloduel
+// a copy of the open-match.dev/open-match-ecosystem/v2/mmf/functions/fifo
 // directory, write your own matchmaking logic in the 'Run' function based on
 // your game's requirements, rename the module it according to what it does,
-// and then compile this main program using your function in place of soloduel.
+// and then compile this main program using your function in place of fifo.
 //
 // A typical production deployment would put that compiled binary into a
 // continer image to serve from a serverless platform like Cloud Run or
@@ -30,7 +30,7 @@ package main
 
 import (
 	"github.com/spf13/viper"
-	mmf "open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/soloduel"
+	mmf "open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/fifo"
 	"open-match.dev/open-match-ecosystem/v2/examples/mmf/server"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 )

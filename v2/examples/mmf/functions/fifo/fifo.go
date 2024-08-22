@@ -28,7 +28,7 @@
 // If you're trying to build this MMF into a container image to deploy on
 // a serverless platform, your starting point should be
 // github.com/googleforgames/open-match-ecosystem/v2/examples/mmf/main.go
-package soloduel
+package fifo
 
 import (
 	"fmt"
@@ -122,53 +122,53 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
 		if len(rosterPlayers) >= tixPerMatch {
 
-			// Initialize an empty roster map
+			// Initialize an empty roster map and roster name
+			rName := fmt.Sprintf("%v_roster%04d", matchName, matchNum)
 			rosters := make(map[string]*pb.Roster)
 
 			// Example of adding data to the roster extension field.
-			ex := make(map[string]*anypb.Any)
-			now, err := anypb.New(timestamppb.Now())
+			rosterExtensions := make(map[string]*anypb.Any)
+			rosterExtensions["CreationTime"], err = anypb.New(timestamppb.Now())
 			if err != nil {
-				panic(err)
+				s.logger.Errorf("Unable to create 'CreationTime' extension for outgoing roster %v", rName)
 			}
-			ex["CreationTime"] = now
 
 			// This example game type only returns one roster per match.
-			// Add the matched player roster to the map.
-			rName := fmt.Sprintf("%v_roster%04d", matchName, matchNum)
+			// Add the matched player roster to the roster map.
 			rosters[rName] = &pb.Roster{
 				Name:       rName,
 				Tickets:    rosterPlayers,
-				Extensions: ex,
+				Extensions: rosterExtensions,
 			}
+
+			// It is best practice to copy all extensions in the profile over to each outgoing match.
+			matchExtensions := req.GetExtensions()
 
 			// Examples of adding data to the match extensions field
 			id := fmt.Sprintf("profile-%s-time-%s-num-%d", matchName, t, matchNum)
-			score, err := anypb.New(&knownpb.Int32Value{Value: 100})
+			matchExtensions["score"], err = anypb.New(&knownpb.Int32Value{Value: 100})
 			if err != nil {
 				s.logger.Errorf("Unable to create 'score' extension for outgoing match %v", id)
 			}
-			mmfName, err := anypb.New(&knownpb.StringValue{Value: matchName})
+
+			matchExtensions["mmfName"], err = anypb.New(&knownpb.StringValue{Value: matchName})
 			if err != nil {
 				s.logger.Errorf("Unable to create 'mmfName' extension for outgoing match %v", id)
 			}
-			profileName, err := anypb.New(&knownpb.StringValue{Value: req.Name})
+
+			matchExtensions["profileName"], err = anypb.New(&knownpb.StringValue{Value: req.Name})
 			if err != nil {
 				s.logger.Errorf("Unable to create 'profileName' extension for outgoing match %v", id)
 			}
 			s.logger.Debugf("Streaming match '%v' back to om-core with roster of %v tickets", id, len(rosterPlayers))
 
 			// Stream the generated match back to Open Match.
-			if err := stream.Send(&pb.StreamedMmfResponse{Match: &pb.Match{
-				Id:      id,
-				Rosters: rosters,
-				Extensions: map[string]*anypb.Any{
-					"score":       score,
-					"mmfName":     mmfName,
-					"profileName": profileName,
-				},
-			},
-			}); err != nil {
+			err = stream.Send(&pb.StreamedMmfResponse{Match: &pb.Match{
+				Id:         id,
+				Rosters:    rosters,
+				Extensions: matchExtensions,
+			}})
+			if err != nil {
 				s.logger.Debugf("Failed to stream proposal to Open Match, got %s", err.Error())
 				return err
 			}

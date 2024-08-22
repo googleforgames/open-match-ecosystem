@@ -288,11 +288,11 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 			"pb_message": "MmfRequest",
 		}).Errorf("cannot marshal protobuf to json")
 	} else {
-		logger.Debug("Marshalled MmfRequest protobuf message to JSON")
+		logger.Trace("Marshalled MmfRequest protobuf message to JSON")
 	}
 
 	// HTTP version of gRPC InvokeMatchmakingFunctions() call
-	logger.Debug("Invokingmmfs")
+	logger.Trace("Calling InvokeMatchmakingFunctions()")
 	resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/matches:fetch", req)
 	if err != nil {
 		logger.Errorf("InvokeMatchmakingFunction call failed: %v", err)
