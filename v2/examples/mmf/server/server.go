@@ -27,12 +27,14 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	knownpb "google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 var (
@@ -41,8 +43,9 @@ var (
 		"component": "matchmaking_function",
 		"function":  "server",
 	}
-	log    = logrus.New()
-	logger *logrus.Entry
+	log            = logrus.New()
+	logger         *logrus.Entry
+	NoSuchKeyError = errors.New("Extension field contains no such key")
 )
 
 // Start creates and starts the Match Function server
@@ -130,4 +133,19 @@ func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Prof
 		}
 	}
 	return req, nil
+}
+
+// WIP, will move to its own module later
+// ExtensionInt32 is a simple helper function to get an int32 out of the extensions field
+// and make it a standard golang int.
+func ExtensionInt32(req *pb.Profile, exKey string) (out int, err error) {
+	int32Pb := &knownpb.Int32Value{}
+	if exValue, ok := req.GetExtensions()[exKey]; ok {
+		err = exValue.UnmarshalTo(int32Pb)
+		if err != nil {
+			return 0, err
+		}
+		return int(int32Pb.Value), err
+	}
+	return 0, NoSuchKeyError
 }

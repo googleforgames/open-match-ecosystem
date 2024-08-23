@@ -106,8 +106,9 @@ var (
 		Mmfs:  []*pb.MatchmakingFunctionSpec{Fifo},
 		Pools: map[string]*pb.Pool{"all": EveryTicket},
 		ExtensionParams: anypbIntMap(map[string]int32{
-			"desiredRosterLen": 4,
-			"minRosterLen":     2,
+			"desiredNumRosters": 1,
+			"desiredRosterLen":  4,
+			"minRosterLen":      2,
 		}),
 	}
 
@@ -612,6 +613,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// simulate 1 in 100 matches being rejected by our matchmaker
 			// because we don't like them or don't have available servers to
 			// host the sessions right now.
+
 			if rand.Intn(100) <= 1 {
 				for _, roster := range match.GetRosters() {
 					for _, ticket := range roster.GetTickets() {
@@ -690,7 +692,8 @@ func CopyPoolFilters(src *pb.Pool, dest *pb.Pool) {
 
 // Make a map[string]int32 into a map of 'any' protobuf messages, suitable to
 // send in the extensions field of a Open Match protobuf message.
-func anypbIntMap(in map[string]int32) (out map[string]*anypb.Any) {
+func anypbIntMap(in map[string]int32) map[string]*anypb.Any {
+	out := make(map[string]*anypb.Any)
 	for key, value := range in {
 		anyValue, err := anypb.New(&knownpb.Int32Value{Value: value})
 		if err != nil {
@@ -698,5 +701,5 @@ func anypbIntMap(in map[string]int32) (out map[string]*anypb.Any) {
 		}
 		out[key] = anyValue
 	}
-	return
+	return out
 }
