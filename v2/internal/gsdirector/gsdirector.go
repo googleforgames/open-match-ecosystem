@@ -17,9 +17,11 @@ package gsdirector
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -29,6 +31,7 @@ import (
 	"github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
+	"github.com/zeebo/xxh3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	knownpb "google.golang.org/protobuf/types/known/wrapperspb"
@@ -39,25 +42,26 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
+	"open-match.dev/open-match-ecosystem/v2/internal/extensions"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
 // Keys for metadata/extensions
+const (
+	// K8s object annotation metadata key where the JSON representation of the
+	// pb.MmfRequest can be found.
+	mmfRequestKey     = "open-match.dev/mmf"
+	mmfProfileHashKey = "open-match.dev/profile-hash"
 
-// K8s object annotation metadata key where the JSON representation of the
-// pb.MmfRequest can be found.
-const mmfRequestKey = "open-match.dev/mmf"
+	// Open Match match protobuf message extensions field key where the JSON
+	// representation of the agones allocation request can be found.
+	agonesAllocatorKey     = "open-match.dev/agones-game-server-allocator"
+	agonesAllocatorHashKey = "open-match.dev/agones-game-server-allocator-hash"
 
-// Open Match match protobuf message extensions field key where the JSON
-// representation of the agones allocation request can be found.
-const agonesAllocatorMatchExtensionKey = "agones.dev/GameServerAllocation"
-
-type GameMode struct {
-	Name            string
-	Mmfs            []*pb.MatchmakingFunctionSpec
-	Pools           map[string]*pb.Pool
-	ExtensionParams map[string]*anypb.Any
-}
+	// Key that holds the k8s label identifying if the game server is ready for (re-)allocation
+	// https://agones.dev/site/docs/integration-patterns/high-density-gameservers/
+	agonesGSReadyKey = "agones.dev/sdk-gs-session-ready"
+)
 
 var (
 	logger            = &logrus.Logger{}
@@ -105,7 +109,7 @@ var (
 		Name:  "SoloDuel",
 		Mmfs:  []*pb.MatchmakingFunctionSpec{Fifo},
 		Pools: map[string]*pb.Pool{"all": EveryTicket},
-		ExtensionParams: anypbIntMap(map[string]int32{
+		ExtensionParams: extensions.AnypbIntMap(map[string]int32{
 			"desiredNumRosters": 1,
 			"desiredRosterLen":  4,
 			"minRosterLen":      2,
@@ -157,30 +161,72 @@ var (
 	//	"ZA_Johannesburg": "africa-south1-b",
 	//},
 
-	FleetExistsError = errors.New("Fleet with that name already exists")
+	FleetExistsError          = errors.New("Fleet with that name already exists")
+	NoSuchAllocationSpecError = errors.New("No such AllocationSpec exists")
+	agonesReallocSpec         = &allocationv1.GameServerAllocationSpec{}
 )
 
+type GameMode struct {
+	Name            string
+	Mmfs            []*pb.MatchmakingFunctionSpec
+	Pools           map[string]*pb.Pool
+	ExtensionParams map[string]*anypb.Any
+}
+type allocOptFunc func(*allocOpts)
+
+type allocOpts struct {
+	selectors allocationv1.GameServerSelector
+}
+
+type GameServerManager interface {
+	Allocate(string, *pb.Match) string
+	GetMmfParams() []*pb.MmfRequest
+	UpdateGameServerMetadata(string, *pb.MmfRequest)
+}
+
 type MockAgonesIntegration struct {
-	// https://github.com/googleforgames/agones/blob/eb08f0b76c6c87d7c13cdef02788ea26800a2df2/pkg/apis/agones/v1/fleet.go
-	// This just mocks out real Agones fleets, holding an in-memory 'fake'
-	// fleet of gameservers
-	Fleets map[string]*agonesv1.Fleet
-
-	// In the format GameServersRequestingMorePlayers[labelValue], where
-	// 'labelValue' represents the backfill MmfRequest params for the server.
-	// So, for example, any server that needs a backfill
-	// would have an ObjectMeta.Label applied using the pre-determined key of
-	// `mmfRequestKey` and the value being a JSON representation of the
-	// pb.MmfRequest protocol buffer message.
-	//
-	// This is a greatly simplified mock.
-	// In reality, this would be implemented using a lister for GameServers
-	// looking for the server with a matching `labelValue` string at some
-	// pre-determined k8s Label key we've chosen to hold server backfill
-	GameServersRequestingMorePlayers map[string]*agonesv1.GameServer
-
 	// Shared logger.
 	Log *logrus.Logger
+
+	// https://github.com/googleforgames/agones/blob/eb08f0b76c6c87d7c13cdef02788ea26800a2df2/pkg/apis/agones/v1/fleet.go
+	// This just mocks out real Agones fleets, holding an in-memory 'fake'
+	// fleet of gameservers. In realite this would be implemented using a
+	// lister for Fleet objects.
+	Fleets map[string]*agonesv1.Fleet
+
+	// A server that needs a different kind of match than that being normally
+	// found for the fleet it is in (examples: backfills, join-in-progress,
+	// high-density gameservers) would have an ObjectMeta.Label applied using
+	// the pre-determined key of `mmfRequestKey` and the value being a hash
+	// representation of the pb.MmfRequest protocol buffer message describing
+	// the criteria for finding tickets for that server's unique circumstances.
+	// It is recommended to actually store that MmfRequest (marshalled to JSON
+	// is preferred as that is human-readable) on an ObjectMeta.Annotation on
+	// the server as well and use that as the single authoritative source for
+	// the matchmaking criteria for this server. If the server needs no unique
+	// matchmaking criteria, the key should be empty, and the server will be
+	// allocated as needed by the matchmaking criteria associated with it's
+	// fleet.
+	//
+	// This is a greatly simplified mock.
+	// In reality, this would be implemented using a lister for GameServer
+	// objects.
+	//
+	// Actual datatypes for this are
+	//   map[*allocationv1.GameServerAllocationSpec]*pb.MmfRequest
+	//IndividualGameServerMatchmakingRequests sync.Map
+	//GameServerMatchmakingRequests
+
+	// Channel on which IndividualGameServerMatchmakingRequests are sent; this
+	// allows us to mock out an Agones Informer on GameServer objects and write
+	// event-driven code that responds to game server allocations the way a
+	// real Agones integration would.
+	gameServerUpdateChan chan *MockGameServerUpdate
+
+	// datatypes for this are map[string]*allocationv1.GameServerAllocationSpec
+	allocationSpecsByHash map[string]*allocationv1.GameServerAllocationSpec
+	allocationSpecsCounts map[string]int
+	mutex                 sync.RWMutex
 }
 
 // We'll add a Kubernetes Annotation to each Agones Fleet that describes how to
@@ -191,9 +237,170 @@ type mmfParametersAnnotation struct {
 	MmfRequests []string
 }
 
-func (m *MockAgonesIntegration) InitializeMmfParams(fleetConfig map[string]map[string]map[string][]*GameMode) error {
+// These are generated to mock out situations where Agones would update a k8s
+// gameserver object.
+//
+// To mock a 'delete':
+//
+//	MatchmakingRequest = nil
+//	DefunctAllocatorSpec = hash of allocationv1.GameServerAllocationSpec(marshalled to JSON) that describes how to select a server to delete
+//
+// To mock a 'create':
+//
+//	MatchmakingRequest = pb.MmfRequest describing matches this server wants to host
+//	DefunctAllocatorSpec = nil
+//
+// To mock an 'update':
+//
+//	MatchmakingRequest       = pb.MmfRequest describing matches this server wants to host
+//	DefunctAllocatorSpecHash = hash of allocationv1.GameServerAllocationSpec(marshalled to JSON) that describes how to select the server as it exists before the update
+type MockGameServerUpdate struct {
+	MatchmakingRequests      []*pb.MmfRequest
+	DefunctAllocatorSpecHash string
+}
 
-	// Initialize fleets and the matchmaking parameters for each
+// UpdateGameServerMetadata is a mock function that adds metadata to
+// an Agones GameServer object in Kubernetes.  This mock only simulates adding
+// matching parameters to the game server metadata. In a real implementation,
+// you'd probably also have input parameters to this function to allow it to
+// add lists, counters, labels, and any other metadata your matchmaker needs to
+// be able to add to a given server.
+//
+// In a real environment, updating k8s metadata generates an update event for
+// all GameServer Informers,
+// (https://agones.dev/site/docs/guides/access-api/#best-practice-using-informers-and-listers)
+// which can be used to trigger code to update your GameServerManager internal
+// state. In this mock, this is all simulated using a golang channel and a
+// simple goroutine that updates the GameServerManager internal state directly
+// when it sees a GameServer update arrive on the channel.
+func (m *MockAgonesIntegration) UpdateGameServerMetadata(defunctAllocationSpecHash string, mmfReqs []*pb.MmfRequest) {
+	m.gameServerUpdateChan <- &MockGameServerUpdate{
+		MatchmakingRequests:      mmfReqs,
+		DefunctAllocatorSpecHash: defunctAllocationSpecHash,
+	}
+}
+
+// Init initializes the fleets the Agones backend mocks according to the
+// provided fleetConfig, and starts a mock Kubernetes Informer that
+// asynchronously watches for changes to Agones Game Server objects.
+// https://agones.dev/site/docs/guides/access-api/#best-practice-using-informers-and-listers
+func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]map[string][]*GameMode) (err error) {
+
+	// Map init
+	m.allocationSpecsByHash = make(map[string]*allocationv1.GameServerAllocationSpec)
+	m.allocationSpecsCounts = make(map[string]int)
+
+	// channel used to simulate a Kubernetes informer event-driven pattern.
+	m.gameServerUpdateChan = make(chan *MockGameServerUpdate)
+	// This is a mock for code you'd write to handle update/create/delete events from an Agones
+	// GameServer object listener
+	go func() {
+
+		var xxHash [16]byte
+
+		for update := range m.gameServerUpdateChan {
+			if update.DefunctAllocatorSpecHash != "" {
+				// This is mocking out processing the data that a k8s informer
+				// event handler would get as the outgoing object spec in a
+				// delete or update operation. Since k8s is effectively removing this
+				// oject, we have to stop tracking it in our agones integration code.
+				m.mutex.Lock()
+				// Make sure there's an existing reference count for this allocation spec
+				if count, countExists := m.allocationSpecsCounts[update.DefunctAllocatorSpecHash]; countExists {
+					// If removing one reference count would result in at least one remaining reference, then decrement
+					if count-1 > 0 {
+						m.allocationSpecsCounts[update.DefunctAllocatorSpecHash]--
+						// If removing one reference count would make the reference count < 1, remove this allocation spec from memory.
+					} else {
+						delete(m.allocationSpecsCounts, update.DefunctAllocatorSpecHash)
+						if _, exists := m.allocationSpecsByHash[update.DefunctAllocatorSpecHash]; exists {
+							delete(m.allocationSpecsByHash, update.DefunctAllocatorSpecHash)
+						}
+					}
+					// done with our updates; let other goroutines access the allocator specs.
+					m.mutex.Unlock()
+				} else {
+					// no updates to make; release the lock while we log an error.
+					m.mutex.Unlock()
+					m.Log.Errorf("Error: %v", NoSuchAllocationSpecError)
+				}
+			}
+			if len(update.MatchmakingRequests) > 0 {
+				// This is mocking out processing the data that a k8s informer
+				// event handler would receive as the incoming object spec in a
+				// create or update operation. We now want to track this new
+				// object spec in our agones integration code.
+				mmfParams := &mmfParametersAnnotation{MmfRequests: make([]string, 0)}
+				for _, mmfReq := range update.MatchmakingRequests {
+					//Convert Mmf Request to JSON.
+					mmfReqJSON, err := protojson.Marshal(mmfReq)
+					if err != nil {
+						m.Log.Errorf("Failed to marshal MMF parameters into JSON: %v", err)
+						continue
+					}
+					// Add JSON string of this Mmf Request to the list of parameters to annotate this game server with.
+					mmfParams.MmfRequests = append(mmfParams.MmfRequests, string(mmfReqJSON[:]))
+				}
+
+				// Make sure we successfully generated a JSON string out of at least one Mmf Request.
+				if len(mmfParams.MmfRequests) == 0 {
+					m.Log.Errorf("Failed to marshal MMF parameters into JSON: %v", err)
+					continue
+				}
+
+				// generate new allocspec based on input Mmf Requests
+				mmfReqJSON, err := json.Marshal(mmfParams)
+				if err != nil {
+					m.Log.Errorf("Unable to marshal MmfRequests annotation to JSON: %v", err)
+					continue
+				}
+				xxHash = xxh3.Hash128Seed(mmfReqJSON, 0).Bytes()
+
+				// Make an allocation spec that will find a server with a label
+				// in the mmfRequestKey (defined as a const at the top of this
+				// file) with a value that is the hash of the Matching Request,
+				// and that will add the Matching Request as an annotation to
+				// the game server upon allocation.
+				newAllocatorSpec := &allocationv1.GameServerAllocationSpec{
+					Selectors: []allocationv1.GameServerSelector{
+						allocationv1.GameServerSelector{
+							LabelSelector: metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									mmfRequestKey: hex.EncodeToString(xxHash[:]),
+								},
+							},
+						},
+					},
+					MetaPatch: allocationv1.MetaPatch{
+						// Attach the matchmaking request that can be used to
+						// make matches this server wants to host as a k8s
+						// annotation.
+						Annotations: map[string]string{
+							mmfRequestKey: string(mmfReqJSON[:]),
+						},
+					},
+				}
+
+				newAllocatorSpecJSON, err := json.Marshal(newAllocatorSpec)
+				if err != nil {
+					m.Log.Errorf("Unable to marshal Agones Game Server Allocation object to JSON: %v", err)
+					continue
+				}
+				xxHash = xxh3.Hash128Seed(newAllocatorSpecJSON, 0).Bytes()
+				newAllocatorSpecHash := hex.EncodeToString(xxHash[:])
+
+				// Finally, write this allocation spec (representing a server) to memory and increment the
+				// reference count of number of servers matching this allocation spec.
+				m.mutex.Lock()
+				m.allocationSpecsByHash[newAllocatorSpecHash] = newAllocatorSpec
+				m.allocationSpecsCounts[newAllocatorSpecHash]++
+				m.mutex.Unlock()
+			}
+		}
+	}()
+
+	// Initialize the matchmaking parameters of the mock Agones fleets
+	// specified in the fleetConfig
 	m.Fleets = make(map[string]*agonesv1.Fleet)
 	for category, regions := range fleetConfig {
 		for region, zones := range regions {
@@ -205,6 +412,44 @@ func (m *MockAgonesIntegration) InitializeMmfParams(fleetConfig map[string]map[s
 					"fleet": fleetName,
 				})
 
+				// Generate an Agones Game Server Allocation that can allocate a ready server from this fleet.
+				agonesAllocSpec := &allocationv1.GameServerAllocationSpec{
+					Selectors: []allocationv1.GameServerSelector{
+						allocationv1.GameServerSelector{
+							LabelSelector: metav1.LabelSelector{
+								MatchLabels: map[string]string{"agones.dev/fleet": fleetName},
+							},
+						},
+					},
+				}
+
+				fleetAllocatorJSON, err := json.Marshal(agonesAllocSpec)
+				if err != nil {
+					fLogger.Errorf("Unable to marshal Agones Game Server Allocation object to JSON: %v", err)
+					continue
+				}
+
+				// Hash the agones allocation spec and store it in a map by its hash for later lookup
+				xxHash := xxh3.Hash128Seed(fleetAllocatorJSON, 0).Bytes()
+				allocHash := hex.EncodeToString(xxHash[:])
+				m.mutex.Lock()
+				m.allocationSpecsByHash[allocHash] = agonesAllocSpec
+				m.allocationSpecsCounts[allocHash] = math.MaxInt32
+				m.mutex.Unlock()
+
+				// Make an Open Match protobuf message extension that holds
+				// the hash of the agones allocation spec. This will be
+				// attached to the profile so the game server director can
+				// look up the proper agones allocation spec to use when
+				// allocating game servers for the resulting matches.
+				agonesAllocatorHashValue, err := anypb.New(&knownpb.StringValue{Value: allocHash})
+				if err != nil {
+					fLogger.Errorf("Unable to create Any protobuf message to hold the Agones Game Server Allocation object's hash: %v", err)
+					continue
+				}
+				fleetEx := map[string]*anypb.Any{
+					agonesAllocatorHashKey: agonesAllocatorHashValue,
+				}
 				// Construct a pool with filters to find players near this zone.
 				zonePool := &pb.Pool{
 					DoubleRangeFilters: []*pb.Pool_DoubleRangeFilter{
@@ -221,18 +466,6 @@ func (m *MockAgonesIntegration) InitializeMmfParams(fleetConfig map[string]map[s
 				mmfParams := &mmfParametersAnnotation{MmfRequests: make([]string, len(modes))}
 				for _, mode := range modes {
 
-					// For every pool this game mode requests, also include the filters for this fleet.
-					composedPools := map[string]*pb.Pool{}
-					for pname, pool := range mode.Pools {
-						// Make a new pool with a name combining the fleet and the game mode's pool name
-						composedName := fmt.Sprintf("%v.%v", fleetName, pname)
-						composedPool := &pb.Pool{Name: composedName}
-						// Add filters to this pool
-						CopyPoolFilters(zonePool, composedPool)
-						CopyPoolFilters(pool, composedPool)
-						composedPools[composedName] = composedPool
-					}
-
 					// By convention, profile names should use reverse-DNS notation
 					// https://en.wikipedia.org/wiki/Reverse_domain_name_notation This
 					// helps with metric attribute cardinality, as we can record
@@ -247,13 +480,35 @@ func (m *MockAgonesIntegration) InitializeMmfParams(fleetConfig map[string]map[s
 						time.Now().UnixNano(),
 					)
 
+					// For every pool this game mode requests, also include the
+					// filters for this fleet.
+					composedPools := map[string]*pb.Pool{}
+					for pname, pool := range mode.Pools {
+						// Make a new pool with a name combining the fleet and the game mode's pool name
+						composedName := fmt.Sprintf("%v.%v", fleetName, pname)
+						composedPool := &pb.Pool{Name: composedName}
+						// Add filters to this pool
+						CopyPoolFilters(zonePool, composedPool)
+						CopyPoolFilters(pool, composedPool)
+						composedPools[composedName] = composedPool
+					}
+
+					// Combine the Profile extensions defined for this mode
+					// with those defined for this fleet. If they both contain
+					// a value at the same key, the Fleet one will take
+					// precedence.
+					modeAndFleetEx := mode.ExtensionParams
+					for key, value := range fleetEx {
+						modeAndFleetEx[key] = value
+					}
+
 					// Marshal this mmf request to a JSON string
 					profile, err := protojson.Marshal(&pb.MmfRequest{
 						Mmfs: mode.Mmfs,
 						Profile: &pb.Profile{
 							Name:       profileName,
 							Pools:      composedPools,
-							Extensions: mode.ExtensionParams,
+							Extensions: modeAndFleetEx,
 						},
 					})
 					if err != nil {
@@ -277,6 +532,7 @@ func (m *MockAgonesIntegration) InitializeMmfParams(fleetConfig map[string]map[s
 
 				// Successfully have all the parameters we need to matchmake
 				// for this fleet, ready to create it.
+				// Refer to the Agones documentation for more information about Fleets.
 				thisFleet := &agonesv1.Fleet{}
 				thisFleet.ApplyDefaults()
 				thisFleet.ObjectMeta = metav1.ObjectMeta{
@@ -286,81 +542,52 @@ func (m *MockAgonesIntegration) InitializeMmfParams(fleetConfig map[string]map[s
 						mmfRequestKey: string(annotation[:]),
 					},
 				}
-
-				// Refer to the Agones documentation for more information about Fleets.
 				m.Fleets[fleetName] = thisFleet
-
 			}
 		}
 	}
 	return nil
 }
 
-// AllocateGameServer mocks doing an Agones game server allocation.
-// The two arguments mock using k8s Labels to initiate and fulfill a backfill
-// for the server:
-// - `existingRequest` mocks out adding custom metadata at the label key
-// `mmfRequestKey` (const defined above) at allocation time. We use this to add
-// a JSON representation of a pb.MmfRequest protobuf message to the server that
-// the director should read and use to invoke MMFs to get more players for this
-// server.
-// -`newRequest` mocks out using a LabelSelector on the label key `mmfRequestKey`
-// (const defined above), specifying that we want to do an allocation of a
-// server with this value at that key. We use this to find the server on which
-// the backfill match belongs after the Director has received the results from
-// Open Match. The backfill MmfRequest is removed in this process. If you want
-// to continue to backfill the server, you should specify an updated MmfRequest
-// in the `addValue` param in the same call.
+// Allocate mocks doing an Agones game server allocation.
+//func (m *MockAgonesIntegration) Allocate(match *pb.Match) (err error) {
+//	// Convert match extension field at specified key to a string
+//	// representation of an Agones allocation request
+//	stringAllocReq := &knownpb.StringValue{}
+//	if err = match.GetExtensions()[agonesAllocatorMatchExtensionKey].UnmarshalTo(stringAllocReq); err != nil {
+//		m.Log.Errorf("failure to read the allocation extension field from match %v: %v", match.GetId(), err)
+//		return err
+//	}
 //
-// https://agones.dev/site/docs/integration-patterns/high-density-gameservers/
-// for more details about how Agones expects you allocate the same
-// allocated server multiple times.  server := &agonesv1.GameServer{}
-func (m *MockAgonesIntegration) AllocateAndBackfillGameServer(existingRequest string, newRequest string) {
-	// Simulate a k8s label selector.
-	// This mocks out adding more players to an existing server with an
-	// outstanding backfill MmfRequest.
-	var serverExists bool
-	if existingRequest != "" {
-		// This is a greatly simplified mock.
-		//
-		// In reality, we would be checking the value at a pre-defined
-		// key in ObjectMeta.Labels for this k8s resource using a lister in order to find the server
-		// with this backfill MmfRequest
-		if _, serverExists = m.GameServersRequestingMorePlayers[existingRequest]; serverExists {
-			// Found the server with this label value. Remove the existing
-			// backfill MmfRequest since it has been fulfilled.
-			delete(m.GameServersRequestingMorePlayers, existingRequest)
-		}
+//	// Marshal the string into an Agones allocation request
+//	agonesAllocReq := &allocationv1.GameServerAllocation{}
+//	if err = json.Unmarshal([]byte(stringAllocReq.Value), agonesAllocReq); err != nil {
+//		m.Log.Errorf("failure to read the allocation extension field from match %v: %v", match.GetId(), err)
+//		return err
+//	}
+//
+//	m.Log.Tracef(" match %v allocation criteria %v", match.GetId(), stringAllocReq.Value)
+//	return nil
+//}
+
+// Allocate mocks doing an Agones game server allocation.
+// If the game server instance being allocated needs to initiate a backfill
+// profile, that profile needs to be created in the AllocationSpec annotation
+// metadata before this function is called, as Agones sets the metadata
+// atomically on game server allocation.
+func (m *MockAgonesIntegration) Allocate(allocationSpecHash string, match *pb.Match) (err error) {
+	// Here is where your backend would do any additional prep tasks for server allocation in Agones
+	//*allocationv1.GameServerAllocationSpec
+	m.Log.Debugf("Allocating server for match %v", match.GetId())
+	allocSpec, ok := m.allocationSpecsByHash.LoadAndDelete(allocationSpecHash)
+	if !ok {
+		m.Log.Errorf(" no allocation criteria found for match %v!", match.GetId())
+		return NoSuchAllocationSpecError
+	} else {
+		// TODO: Here is where you'd use the k8s api to request an agones game server allocation in a real implementation.
+		m.Log.Debugf("Allocating server for match %v", match.GetId())
+		m.Log.Tracef(" match %v allocation criteria %v", match.GetId(), allocSpec)
 	}
-
-	if newRequest != "" {
-		// Simulate 'allocating' a game server in the provided fleet, with the
-		// provided value for the label at some pre-defined key.
-		// This mocks out allocating a server that includes a backfill MmfRequest
-		// to add more players to it.
-		m.GameServersRequestingMorePlayers[newRequest] = &agonesv1.GameServer{}
-	}
-
-}
-
-func (m *MockAgonesIntegration) Allocate(match *pb.Match) (err error) {
-	// Convert match extension field at specified key to a string
-	// representation of an Agones allocation request
-	stringAllocReq := &knownpb.StringValue{}
-	if err = match.GetExtensions()[agonesAllocatorMatchExtensionKey].UnmarshalTo(stringAllocReq); err != nil {
-		m.Log.Errorf("failure to read the allocation extension field from match %v: %v", match.GetId(), err)
-		return err
-	}
-
-	// Marshal the string into an Agones allocation request
-	agonesAllocReq := &allocationv1.GameServerAllocation{}
-	if err = json.Unmarshal([]byte(stringAllocReq.Value), agonesAllocReq); err != nil {
-		m.Log.Errorf("failure to read the allocation extension field from match %v: %v", match.GetId(), err)
-		return err
-	}
-
-	// Here is where you'd actually use the k8s api to request an agones game server allocation.
-	m.Log.Debugf("Allocating server for match %v using allocation criteria %v", match.GetId(), stringAllocReq.Value)
 	return nil
 }
 
@@ -368,26 +595,70 @@ func (m *MockAgonesIntegration) GetMmfParams() (requests []*pb.MmfRequest) {
 
 	var err error
 
-	// servers that need backfills should be serviced with higher priority
+	// servers with unique MmfRequests (examples: backfill, join-in-progress,
+	// high-density game servers, etc) should be serviced with higher priority,
+	// so add them to the request list first.
 	//
-	// In a real Agones integration, you'd write an informer + lister that
-	// allow you to query all existing Agones GameServers for a backfill
-	// MmfRequest label in order to minimize impact to the k8s control plane:
-	// https://agones.dev/site/docs/guides/access-api/#best-practice-using-informers-and-listers
-	for mmfRequest, _ := range m.GameServersRequestingMorePlayers {
+	// This sync.Map.Range() is the equivalent to this kind of loop over a
+	// normal golang map:
+	// for mmfRequest, _ := m.IndividualGameServerMatchmakingRequests {
+	//		requests = append(requests, mmfRequest.(*pb.MmfRequest))
+	// }
+	// See the sync.Map documentation for more info.
+	m.IndividualGameServerMatchmakingRequests.Range(func(mmfRequest, _ interface{}) bool {
+		requests = append(requests, mmfRequest.(*pb.MmfRequest))
+		return true
+	})
 
-		// Try to marshal the request from string back into a pb.MmfRequest
-		reqPb := &pb.MmfRequest{}
-		err = protojson.Unmarshal([]byte(mmfRequest), reqPb)
-		if err != nil {
-			m.Log.Error("cannot unmarshal server matchmaking request back into protobuf, ignoring...")
-			continue
-		}
+	//		// Try to marshal the request from string back into a pb.MmfRequest
+	//		//reqPb := &pb.MmfRequest{}
+	//		//err = protojson.Unmarshal([]byte(mmfRequest), reqPb)
+	//		//if err != nil {
+	//		//	m.Log.Error("cannot unmarshal server matchmaking request back into protobuf, ignoring...")
+	//		//	continue
+	//		//}
+	//
+	//		// Generate an Agones Game Server Allocation object that can select this server for re-allocation.
+	//		agonesReallocSpec := &allocationv1.GameServerAllocationSpec{
+	//			Selectors: []allocationv1.GameServerSelector{
+	//				allocationv1.GameServerSelector{
+	//					metav1.LabelSelector{
+	//						MatchLabels: map[string]string{
+	//							agonesGSReadyKey: "true",
+	//							// TODO: this needs to be a hash or something, labels can only be 63 chars?
+	//							//mmfRequestKey: mmfRequest,
+	//						},
+	//					},
+	//				},
+	//			},
+	//		}
+	//		backfillRequestingGameServerSelector := allocationv1.GameServerSelector{}
+	//		backfillRequestingGameServerSelector.LabelSelector = metav1.LabelSelector{
+	//			MatchLabels: map[string]string{
+	//				agonesGSReadyKey: "true",
+	//				// TODO: this needs to be a hash or something, labels can only be 63 chars?
+	//				//mmfRequestKey: mmfRequest,
+	//			},
+	//		}
+	//		agonesReallocSpec.Selectors = append(agonesReallocSpec.Selectors, backfillRequestingGameServerSelector)
 
-		// Successfully got the backfill request, add it to the list of MMF
-		// requests to send to Open Match.
-		requests = append(requests, reqPb)
-	}
+	// TODO: remove after testing
+	//		agonesReallocatorJSON, err := json.Marshal(agonesReallocReq)
+	//		if err != nil {
+	//			logger.Errorf("Unable to marshal Agones Game Server Allocation object to JSON: %v", err)
+	//			continue
+	//		}
+	//
+	//		exAgonesReallocator, err := anypb.New(&knownpb.StringValue{Value: string(agonesReallocatorJSON)})
+	//		if err != nil {
+	//			logger.Errorf("Unable to convert number of ready replicas into an anypb: %v", err)
+	//			continue
+	//		}
+	//		reqPb.Profile.Extensions = map[string]*anypb.Any{
+	//			agonesAllocatorMatchExtensionKey: exAgonesReallocator,
+	//		}
+	//		requests = append(requests, reqPb)
+
 	m.Log.Tracef("retrieved %v backfill MmfRequests from servers", len(requests))
 
 	for fleetName, fleet := range m.Fleets {
@@ -407,25 +678,12 @@ func (m *MockAgonesIntegration) GetMmfParams() (requests []*pb.MmfRequest) {
 			continue
 		}
 
-		// Generate an Agones Game Server Allocation object that can allocate a ready server from this fleet.
-		agonesAllocReq := &allocationv1.GameServerAllocation{}
-		agonesAllocReq.ApplyDefaults()
-		fleetSelector := allocationv1.GameServerSelector{}
-		fleetSelector.LabelSelector = metav1.LabelSelector{
-			MatchLabels: map[string]string{"agones.dev/fleet": fleetName},
-		}
-		agonesAllocReq.Spec.Selectors = append(agonesAllocReq.Spec.Selectors, fleetSelector)
-		fleetAllocatorJSON, err := json.Marshal(agonesAllocReq)
-		if err != nil {
-			log.Errorf("Unable to marshal Agones Game Server Allocation object to JSON: %v", err)
-			continue
-		}
-
 		// Each fleet could have multiple different MmfRequests associated with
 		// it, to allow it to run multiple different kinds of matchmaking
 		// concurrently (common with undifferentiated server fleets)
 		log.Tracef("retrieved '%v' fleet MmfRequests from k8s annotation.", len(jsonRequests.MmfRequests))
 		for _, request := range jsonRequests.MmfRequests {
+
 			// For some reason I'm not sure about, the json.Unmarshal is giving
 			// an mmfParametersAnnotation{} struct with one empty item in the
 			// mmfParametersAnnotation.MmfRequests array, so we skip if we get
@@ -441,7 +699,8 @@ func (m *MockAgonesIntegration) GetMmfParams() (requests []*pb.MmfRequest) {
 					continue
 				}
 
-				// Get number of ready servers, and put this in the profile extensions
+				// Get number of ready servers that can accept matches from
+				// this MmfRequest, and put this in the profile extensions
 				// field so the mmf can read it.
 				exReadyReplicas, err := anypb.New(&knownpb.Int32Value{Value: fleet.Status.ReadyReplicas})
 				if err != nil {
@@ -451,20 +710,6 @@ func (m *MockAgonesIntegration) GetMmfParams() (requests []*pb.MmfRequest) {
 				reqPb.Profile.Extensions = map[string]*anypb.Any{
 					"readyServerCount": exReadyReplicas,
 				}
-
-				// Put the fleet allocator into the profile extensions. We'll need to
-				// write our MMF so it propogates this value into the extensions
-				// field of returned matches, so we can send those matches to the
-				// correct fleet when they come back from Open Match.
-				exAgonesAllocator, err := anypb.New(&knownpb.StringValue{Value: string(fleetAllocatorJSON)})
-				if err != nil {
-					log.Errorf("Unable to convert number of ready replicas into an anypb: %v", err)
-					continue
-				}
-				reqPb.Profile.Extensions = map[string]*anypb.Any{
-					agonesAllocatorMatchExtensionKey: exAgonesAllocator,
-				}
-				requests = append(requests, reqPb)
 			}
 		}
 	}
@@ -472,11 +717,12 @@ func (m *MockAgonesIntegration) GetMmfParams() (requests []*pb.MmfRequest) {
 }
 
 type MockDirector struct {
-	OmClient          *omclient.RestfulOMGrpcClient
-	Cfg               *viper.Viper
-	Log               *logrus.Logger
-	Assignments       sync.Map
-	GameServerManager *MockAgonesIntegration
+	OmClient                 *omclient.RestfulOMGrpcClient
+	Cfg                      *viper.Viper
+	Log                      *logrus.Logger
+	Assignments              sync.Map
+	GameServerManager        *MockAgonesIntegration
+	pendingMmfRequestsByHash map[string]*pb.MmfRequest
 }
 
 func (d *MockDirector) Run(ctx context.Context) {
@@ -491,7 +737,8 @@ func (d *MockDirector) Run(ctx context.Context) {
 	// local var init
 	ticketIdsToActivate := make(chan string, 10000)
 	var startTime time.Time
-	var matches, proposedMatches []*pb.Match
+	var proposedMatches []*pb.Match
+	var matches map[*pb.Match]string
 
 	// Kick off main matchmaking loop
 	// Loop for the configured number of cycles
@@ -501,7 +748,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// Loop var init
 		startTime = time.Now()
 		proposedMatches = []*pb.Match{}
-		matches = []*pb.Match{}
+		matches = map[*pb.Match]string{}
 
 		// Make a fresh context for this loop.
 		//
@@ -535,7 +782,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// Each of those results channels is sent to this match result
 		// processing goroutine on the 'fanInChan' channel.
 		//
-		// NOTE: This is a complex goroutine so it's over-commented.
+		// This is a complex goroutine so it's over-commented.
 		wg := sync.WaitGroup{}
 		go func() {
 
@@ -560,6 +807,10 @@ func (d *MockDirector) Run(ctx context.Context) {
 							// We got a match result.
 							logger.Trace("Received match from MMF")
 
+							// NOTE: If you have some match processing that can
+							// be done asynchronously, like reading match metadata from
+							// the extensions field or constructing a ticket collision map
+							// to examine later, this is a good place to kick off that work.
 							proposedMatches = append(proposedMatches, resPb.GetMatch())
 						} // end of else clause
 
@@ -609,43 +860,91 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// - matches that outstrip our game server capacity, etc.
 		numRejectedTickets := 0
 		logger.Debugf("%v proposed matches to evaluate", len(proposedMatches))
-		for _, match := range proposedMatches {
-			// simulate 1 in 100 matches being rejected by our matchmaker
-			// because we don't like them or don't have available servers to
-			// host the sessions right now.
 
-			if rand.Intn(100) <= 1 {
-				for _, roster := range match.GetRosters() {
-					for _, ticket := range roster.GetTickets() {
-						// queue this ticket ID to be re-activated
-						ticketIdsToActivate <- ticket.GetId()
-						numRejectedTickets++
-					}
+		// Simple local function to 'reject' a proposed match by adding all the
+		// tickets in it to the list of tickets to reactivate in OM.
+		rejectMatch := func(match *pb.Match) {
+			//rejectedMatchesCounter.Add(ctx, 1)
+			for _, roster := range match.GetRosters() {
+				for _, ticket := range roster.GetTickets() {
+					// queue this ticket ID to be re-activated
+					ticketIdsToActivate <- ticket.GetId()
+					numRejectedTickets++
 				}
-				//rejectedMatchesCounter.Add(ctx, 1)
-			} else {
-				//acceptedMatchesCounter.Add(ctx, 1)
-				matches = append(matches, match)
 			}
 		}
 
-		for _, match := range matches {
+		// Here is where you loop over all the returned match proposals and make decisions.
+		for _, match := range proposedMatches {
+			// Common decision points:
+			//  - if multiple matches have the same ticket ('ticket
+			//  collision'), which is used? What happens to the unused matches?
+			//  Completely discarded, or colliding tickets removed, and
+			//  allocated with a backfill request?
+			//  - Order in which the matches are allocated servers? Probably based on
+			//  some kind of quality 'score' extension field provided by the MMF?
+			//  - etc.
+			//
+			// In this mock, we simulate 1 in 100 matches being rejected by our
+			// matchmaker because we don't like them or don't have available
+			// servers to host the sessions right now.
+			if rand.Intn(100) <= 1 {
+				rejectMatch(match)
+				continue
+			}
+
+			// Find the profile of this match (by hash) in the list of
+			// active matchmaking requests we are running
+			//
+			// Get the profile hash from the match extensions field
+			profileHash, err := extensions.String(match.Extensions, mmfProfileHashKey)
+			if err != nil {
+				// Couldn't get the hash, reject match.
+				logger.WithFields(logrus.Fields{
+					"match_id": match.Id,
+				}).Error("Unable to get Profile hash from returned match, rejecting match: %v")
+				rejectMatch(match)
+				continue
+			}
+
+			// Make sure the match profile is in our list  of active
+			// matchmaking requests
+			if _, exists := d.pendingMmfRequestsByHash[profileHash]; !exists {
+				// No profile with that hash in our list, reject match.
+				rejectMatch(match)
+				continue
+			}
+
+			// This proposed match passed all our decision points and validation checks,
+			// lets add it to the map of matches we want to allocate a server for.
+			//acceptedMatchesCounter.Add(ctx, 1)
+			allocatorSpec, err := extensions.String(d.pendingMmfRequestsByHash[profileHash].GetProfile().GetExtensions(), agonesAllocatorHashKey)
+			if err != nil {
+				rejectMatch(match)
+				continue
+			}
+			matches[match] = allocatorSpec
+		}
+
+		for match, allocatorSpec := range matches {
 			// Here is where you would actually allocate the server in Agones
-			// This is just a mock, so it instead just prints a log message.
-			d.GameServerManager.Allocate(match)
+			// The mocks just print a log message telling you when an
+			// allocation would take place.
+			//d.GameServerManager.Allocate(match, &allocationv1.GameServerAllocationSpec{})
+			d.GameServerManager.Allocate(allocatorSpec, match)
 		}
 
 		// Re-activate the rejected tickets so they appear in matchmaking pools again.
 		d.OmClient.ActivateTickets(ctx, ticketIdsToActivate)
 
-		// Status update closure.
+		// Status update closure. This may be removed or made into a separate
+		// function in future versions
 		{
 			// Print status for this cycle
 			logger.Trace("Acquiring lock to write cycleStatus")
 
 			numCycles := fmt.Sprintf("/%v", d.Cfg.GetInt("NUM_MM_CYCLES"))
-			// ~600k seconds is roughly a week
-			if d.Cfg.GetInt("NUM_MM_CYCLES") > 600000 {
+			if d.Cfg.GetInt("NUM_MM_CYCLES") > 600000 { // ~600k seconds is roughly a week
 				numCycles = "/--" // Number is so big as to be meaningless, just don't display it
 			}
 
@@ -659,6 +958,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			logger.Info(cycleStatus)
 		}
 
+		// Sleep before next loop.
 		// TODO: proper exp BO + jitter
 		sleepDur := time.Until(startTime.Add(time.Millisecond * 1000)) // >= OM_CACHE_IN_WAIT_TIMEOUT_MS for efficiency's sake
 		dur := time.Now().Sub(startTime)
@@ -688,18 +988,4 @@ func CopyPoolFilters(src *pb.Pool, dest *pb.Pool) {
 		dest.CreationTimeRangeFilter = src.GetCreationTimeRangeFilter()
 	}
 	return
-}
-
-// Make a map[string]int32 into a map of 'any' protobuf messages, suitable to
-// send in the extensions field of a Open Match protobuf message.
-func anypbIntMap(in map[string]int32) map[string]*anypb.Any {
-	out := make(map[string]*anypb.Any)
-	for key, value := range in {
-		anyValue, err := anypb.New(&knownpb.Int32Value{Value: value})
-		if err != nil {
-			panic(err)
-		}
-		out[key] = anyValue
-	}
-	return out
 }
