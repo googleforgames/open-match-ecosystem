@@ -22,7 +22,7 @@
 //     language, consult the protoc documentation for instructions on generating
 //     grpc server source files in your language of choice.
 //   - This package doesn't include the matchmaking function itself.  You pass
-//     in a Server struct when calling Start that includes your MMF Run()
+//     in a Server struct when calling StartServer that includes your MMF Run()
 //     implementation.
 package server
 
@@ -48,7 +48,7 @@ var (
 	NoSuchKeyError = errors.New("Extension field contains no such key")
 )
 
-// Start creates and starts the Match Function server
+// StartServer creates and starts the Match Function server
 func StartServer(port int32, mmfServer pb.MatchMakingFunctionServiceServer, l *logrus.Logger) error {
 	var err error
 	log = l

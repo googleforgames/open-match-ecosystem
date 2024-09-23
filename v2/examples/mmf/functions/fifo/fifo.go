@@ -40,6 +40,7 @@ package fifo
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -48,7 +49,8 @@ import (
 	knownpb "google.golang.org/protobuf/types/known/wrapperspb"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
-	mmfUtils "open-match.dev/open-match-ecosystem/v2/examples/mmf/server"
+	"open-match.dev/open-match-ecosystem/v2/examples/mmf/server"
+	"open-match.dev/open-match-ecosystem/v2/internal/extensions"
 )
 
 const (
@@ -103,7 +105,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
 	// Use the helper function to reconstruct the incoming request from partial
 	// 'chunked' requests.
-	req, err := mmfUtils.GetChunkedRequest(stream)
+	req, err := server.GetChunkedRequest(stream)
 	if err != nil {
 		s.logger.Errorf("error getting chunked request: %v", err)
 	}
@@ -125,15 +127,15 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
 	// Retrieve custom parameters we put into the request profile. If they don't exist,
 	// we just fall back to the defaults declared in the source.
-	exDesiredNumRosters, err := mmfUtils.ExtensionInt32(req, "desiredNumRosters")
+	exDesiredNumRosters, err := extensions.Int32(req.GetExtensions(), "desiredNumRosters")
 	if err == nil {
 		desiredNumRosters = exDesiredNumRosters
 	}
-	exDesiredRosterLen, err := mmfUtils.ExtensionInt32(req, "desiredRosterLen")
+	exDesiredRosterLen, err := extensions.Int32(req.GetExtensions(), "desiredRosterLen")
 	if err == nil {
 		desiredRosterLen = exDesiredRosterLen
 	}
-	exMinRosterLen, err := mmfUtils.ExtensionInt32(req, "minRosterLen")
+	exMinRosterLen, err := extensions.Int32(req.GetExtensions(), "minRosterLen")
 	if err == nil {
 		minRosterLen = exMinRosterLen
 	}
@@ -238,11 +240,66 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		// a lower quality 'score' and wanting more players.
 		if rosterLengthsLessThan(match, desiredRosterLen) {
 			score = 25 // see above comments about the score.
-			match.Extensions["backfillRequired"], err = anypb.New(&knownpb.BoolValue{Value: true})
-			if err != nil {
-				s.logger.Errorf("Unable to create 'backfillRequired' flag as an extension for match %v",
-					match.Id)
-			}
+
+			// If your matchmaker design includes having the matching logic
+			// determine what kind of tickets should be added to an existing
+			// session on subsequent matchmaking cycles (for example, a
+			// backfill, join-in-progress, or high-density game server case),
+			// here is where you would construct a profile with all the
+			// necessary matching parameters. Alternatively, if your matchmaker
+			// design prefers to determine what kinds of tickets to search for
+			// elsewhere - for example, in your game server management
+			// software, then you can remove or ignore this section.
+
+			// TODO: finish this backfill WIP and test it
+			// Next time this profile is used for matching, we will only
+			// request as many tickets as we have empty slots in the rosters.
+			//			remainingRostersCapacity := desiredRosterLen - lowestRosterLen(match)
+			//			s.logger.Infof("Returning match with %v/%v players in a roster; attaching a backfill MMF request", lowestRosterLen(match), desiredRosterLen)
+			//			s.logger.Tracef("Retrieving MMF list to invoke when requesting backfill from extension %v", extensions.MMFRequestKey)
+			//
+			//			// Generate an updated profile to get more tickets for this match.
+			//			updatedPools := map[string]*pb.Pool{}
+			//			// Copy over the pool filters and extensions used to run this MMF.
+			//			for pname, pool := range req.GetPools() {
+			//				updatedPools[pname] = &pb.Pool{
+			//					Name:                    pool.GetName(),
+			//					TagPresentFilters:       pool.GetTagPresentFilters(),
+			//					StringEqualsFilters:     pool.GetStringEqualsFilters(),
+			//					DoubleRangeFilters:      pool.GetDoubleRangeFilters(),
+			//					CreationTimeRangeFilter: pool.GetCreationTimeRangeFilter(),
+			//					Extensions:              pool.GetExtensions(),
+			//				}
+			//			}
+			//			updatedProfile := &pb.Profile{
+			//				Name:       "backfill." + match.GetId(),
+			//				Pools:      updatedPools,
+			//				Extensions: req.GetExtensions(),
+			//			}
+			//			updatedProfile.Extensions["desiredRosterLen"], err = anypb.New(&knownpb.Int32Value{Value: int32(remainingRostersCapacity)})
+			//			if err != nil {
+			//				s.logger.Errorf("Unable to update the desiredRosterLen to reflect ticket capacity of match %v",
+			//					match.Id)
+			//			}
+			//
+			//			// A pb.MmfRequest with a list of MMFs to use for backfills and an empty profile were
+			//			// attached as a request extension by our matchmaker, retrieve it.
+			//			bfRequest, err := extensions.MMFRequest(req.GetExtensions(), extensions.MMFRequestKey)
+			//			if err != nil {
+			//				s.logger.Errorf("Unable to retrieve backfill details from extension %v, returning match without backfill request: err", extensions.MMFRequestKey)
+			//				continue
+			//			}
+			//
+			//			// Attach the updated profile with new matching criteria to our backfill request.
+			//			bfRequest.Profile = updatedProfile
+			//
+			//			// Add the new backfill matchmaking request to the match extensions
+			//			// field, so it is returned to our matchmaker.
+			//			match.Extensions[extensions.MMFRequestKey], err = anypb.New(bfRequest)
+			//			if err != nil {
+			//				s.logger.Errorf("Unable to create backfill matching profile as an extension for match %v",
+			//					match.Id)
+			//			}
 		}
 
 		// Add match quality 'score' extension data to the match. See above
@@ -269,13 +326,22 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	return nil
 }
 
-// rosterLengthsLessThan returns true if all pb.Roster.Tickets slices in the provided
-// match have fewer than 'length' elements in them.
-func rosterLengthsLessThan(match *pb.Match, length int) bool {
+// lowestRosterLength returns the length of the roster with the lowest number of tickets in it.
+func lowestRosterLen(match *pb.Match) (length int) {
+	length = math.MaxInt32
 	for _, roster := range match.Rosters {
 		if len(roster.Tickets) < length {
-			return true
+			length = len(roster.Tickets)
 		}
+	}
+	return
+}
+
+// rosterLengthsLessThan returns true if all pb.Roster.Tickets slices in the provided
+// match have fewer than 'length' tickets in them.
+func rosterLengthsLessThan(match *pb.Match, length int) bool {
+	if lowestRosterLen(match) < length {
+		return true
 	}
 	return false
 }

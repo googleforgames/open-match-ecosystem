@@ -41,8 +41,6 @@ import (
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
-
-	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
 )
 
 var (
@@ -57,6 +55,7 @@ func main() {
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
+	cfg.SetDefault("PORT", "8090")
 
 	// OM core config that the matchmaker needs to respect
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
@@ -91,15 +90,16 @@ func main() {
 			Log:    log,
 			Cfg:    cfg,
 		},
-		GameServerManager: &gsdirector.MockAgonesIntegration{
-			Log:                              log,
-			Fleets:                           make(map[string]*agonesv1.Fleet),
-			GameServersRequestingMorePlayers: make(map[string]*agonesv1.GameServer),
+		GSManager: &gsdirector.MockAgonesIntegration{
+			Log: log,
 		},
 		Cfg: cfg,
 		Log: log,
 	}
-	d.GameServerManager.InitializeMmfParams(gsdirector.FleetConfig)
+	err := d.GSManager.Init(gsdirector.FleetConfig)
+	if err != nil {
+		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
+	}
 
 	// TODO: move this into the omclient
 	//Check connection before spinning everything up.
@@ -131,8 +131,8 @@ func main() {
 	})
 
 	// Start http server so this application can be run on serverless platforms.
-	logger.Infof("PORT %v detected", os.Getenv("PORT"))
-	srv := &http.Server{Addr: ":" + os.Getenv("PORT")}
+	logger.Infof("PORT '%v' detected", cfg.GetString("PORT"))
+	srv := &http.Server{Addr: ":" + cfg.GetString("PORT")}
 	go func() {
 		// ErrServerClosed is the error returned by http.Server on graceful exit.
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
