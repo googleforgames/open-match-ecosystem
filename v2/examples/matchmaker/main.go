@@ -17,7 +17,6 @@ package main
 
 import (
 	"context"
-	"io"
 	"math"
 	"net/http"
 	_ "net/http"
@@ -40,6 +39,8 @@ import (
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
+	"open-match.dev/open-match-ecosystem/v2/internal/mmqueue"
+	"open-match.dev/open-match-ecosystem/v2/internal/mocks/gameclient"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
@@ -52,17 +53,31 @@ var (
 
 func main() {
 
+	// Quit this process on the signals sent by kubernetes/knative/Cloud Run/ctrl+c.
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Read config
+	cfg := viper.New()
+	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
+	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
+	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 20)
+	cfg.SetDefault("PORT", 8081)
+
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
-	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
-	cfg.SetDefault("PORT", "8090")
 
 	// OM core config that the matchmaker needs to respect
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 
+	// Ticket creation config
+	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 3)
+
 	// InvokeMatchmaking Function config
-	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)                   // Default is essentially forever
-	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 3) // Exit if 3 matchmaking cycles come back empty
+	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)                               // Default is essentially forever
+	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", math.MaxInt32) // Exit if consequtive matchmaking cycles come back empty
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -77,11 +92,20 @@ func main() {
 	// Set up structured logging
 	// Default logging configuration is json that plays nicely with Google Cloud Run.
 	log := logging.NewSharedLogger(cfg)
-	logger := log.WithFields(logrus.Fields{"component": "game_server_director"})
+	logger := log.WithFields(logrus.Fields{"application": "matchmaker"})
 	logger.Debugf("%v cycles", cfg.GetInt("NUM_MM_CYCLES"))
 
-	// Connect to om-core server
-	ctx := context.Background()
+	// Initialize the queue
+	q := &mmqueue.MatchmakerQueue{
+		OmClient: &omclient.RestfulOMGrpcClient{
+			Client: &http.Client{},
+			Log:    log,
+			Cfg:    cfg,
+		},
+		Cfg:               cfg,
+		Log:               log,
+		ClientRequestChan: make(chan *mmqueue.ClientRequest),
+	}
 
 	// Initialize the director
 	d := &gsdirector.MockDirector{
@@ -96,6 +120,7 @@ func main() {
 		Cfg: cfg,
 		Log: log,
 	}
+	// Initialize the game server manager used by the director
 	err := d.GSManager.Init(gsdirector.FleetConfig)
 	if err != nil {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
@@ -115,19 +140,42 @@ func main() {
 		}
 	}
 
+	// Start the ticket matchmaking queue. This is where tickets get processd and stored in OM2.
+	go q.Run(ctx)
+
 	// Start the director. This is where profiles get sent to the InvokeMMFs()
 	// call, and matches returned.
 	go d.Run(ctx)
 
-	// Quit this process on the signals sent by kubernetes/knative/Cloud Run.
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
-
 	// Basic default handler that just returns the current matchmaking progress status as a string.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		statusUpdateMutex.RLock()
-		defer statusUpdateMutex.RUnlock()
-		io.WriteString(w, cycleStatus)
+
+		// Make a channel on which the queue will return its http.Status result
+		resultChan := make(chan int)
+		q.ClientRequestChan <- &mmqueue.ClientRequest{
+			ResultChan: resultChan,
+			Ticket: func(r *http.Request) *pb.Ticket {
+				// In a real game client, you'd probably use whatever communication
+				// protocol/format (JSON string, binary encoding, a custom format,
+				// etc) your game engine or dev kit encourages, and parse that data
+				// from the http.Request into the Open Match protobuf `ticket`
+				// protobuf here.
+				//
+				// This example just makes an empty ticket.
+				//
+				// This ticket can only appear in Pools with a single
+				// CreationTimeFilter, as they have no other attributes to
+				// match against (CreationTime is created by Open Match upon
+				// ticket creation).
+				ticket := &pb.Ticket{}
+				// TODO: remove this line once the test framework is trued up
+				ticket = gameclient.Simple(ctx)
+				return ticket
+			}(r),
+		}
+
+		// Write the http.Status code returned by the queue
+		w.WriteHeader(<-resultChan)
 	})
 
 	// Start http server so this application can be run on serverless platforms.
