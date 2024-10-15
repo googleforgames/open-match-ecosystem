@@ -389,19 +389,23 @@ func allocationSpecFromMMFRequests(mmfParams []*pb.MmfRequest, logger *logrus.Lo
 // handle UPDATE/CREATE/DELETE events from an Agones GameServer object listener
 // https://agones.dev/site/docs/guides/access-api/#best-practice-using-informers-and-listers
 func (m *MockAgonesIntegration) processGameServerUpdates() {
+	pLogger := m.Log.WithFields(logrus.Fields{
+		"component": "agones_integration",
+		"operation": "get_mmf_params",
+	})
 
 	//var xxHash [16]byte
 
 	for update := range m.gameServerUpdateChan {
 
-		m.Log.WithFields(logrus.Fields{"update": update}).Trace("Received game server update")
+		pLogger.WithFields(logrus.Fields{"update": update}).Trace("Received game server update")
 		// This mocks processing the data that a k8s informer event
 		// handler would get as the 'old' game server in a DELETE or
 		// UPDATE operation. Since k8s is effectively removing this
 		// server, we have to stop tracking it in our agones
 		// integration code.
 		if update.allocSpec != nil {
-			asLogger := m.Log.WithFields(logrus.Fields{
+			asLogger := pLogger.WithFields(logrus.Fields{
 				"alloc_spec": update.allocSpec.Selectors[0].LabelSelector.MatchLabels,
 			})
 			asLogger.Trace(" game server update contains an alloc spec to remove from matching")
@@ -446,7 +450,7 @@ func (m *MockAgonesIntegration) processGameServerUpdates() {
 		if update.mmfParams != nil && len(update.mmfParams) > 0 {
 			newAllocatorSpec, err := allocationSpecFromMMFRequests(update.mmfParams, m.Log)
 			if err != nil {
-				m.Log.Errorf("Failure to generate new Agones Allocation Spec from provided MmfRequests: %v", err)
+				pLogger.Errorf("Failure to generate new Agones Allocation Spec from provided MmfRequests: %v", err)
 			}
 
 			//// Add JSON string of this Mmf Request to the list of requests to annotate this game server with.
@@ -500,7 +504,7 @@ func (m *MockAgonesIntegration) processGameServerUpdates() {
 			// Now hash the allocation spec we just created to use as a key.
 			newAllocatorSpecJSONBytes, err := json.Marshal(newAllocatorSpec)
 			if err != nil {
-				m.Log.Errorf("Unable to marshal Agones Game Server Allocation object to JSON: %v", err)
+				pLogger.Errorf("Unable to marshal Agones Game Server Allocation object to JSON: %v", err)
 				continue
 			}
 			//xxHash = xxh3.Hash128Seed(newAllocatorSpecJSONBytes, 0).Bytes()
@@ -795,6 +799,10 @@ type ascount struct {
 // matchmaking cycle in order to find matches to put on game servers managed by
 // Agones.
 func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
+	gLogger := m.Log.WithFields(logrus.Fields{
+		"component": "agones_integration",
+		"operation": "get_mmf_params",
+	})
 
 	requests := make([]*pb.MmfRequest, 0)
 	// Sort the allocation specs by the number of servers they match (e.g.
@@ -824,7 +832,7 @@ func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
 		if ok {
 
 			for _, request := range gsSet.server.mmfParams {
-				m.Log.Tracef(" retrieved MmfRequest with profile: %v", request.GetProfile().GetName())
+				gLogger.Tracef(" retrieved MmfRequest with profile: %v", request.GetProfile().GetName())
 
 				// retrieve existing profile extensions
 				extensions := request.GetProfile().GetExtensions()
@@ -837,7 +845,7 @@ func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
 				// field so the mmf can read it.
 				exReadyCount, err := anypb.New(&knownpb.Int32Value{Value: int32(ac.count)})
 				if err != nil {
-					m.Log.Errorf("Unable to convert number of ready game servers into an anypb: %v", err)
+					gLogger.Errorf("Unable to convert number of ready game servers into an anypb: %v", err)
 					continue
 				}
 				extensions[ex.AgonesGSReadyCountKey] = exReadyCount
@@ -849,13 +857,13 @@ func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
 				// time, but this will do for now
 				allocSpecJSON, err := json.Marshal(gsSet.server.allocSpec)
 				if err != nil {
-					m.Log.Errorf("Unable to marshal Agones Game Server Allocation object %v to JSON, discarding mmfRequest %v: %v",
+					gLogger.Errorf("Unable to marshal Agones Game Server Allocation object %v to JSON, discarding mmfRequest %v: %v",
 						gsSet.server.allocSpec, gsSet.server.mmfParams, err)
 					continue
 				}
 				exAllocSpecJSON, err := anypb.New(&knownpb.StringValue{Value: string(allocSpecJSON[:])})
 				if err != nil {
-					m.Log.Errorf("Unable to marshal Agones Game Server Allocation object %v to anyPb, discarding mmfRequest %v: %v",
+					gLogger.Errorf("Unable to marshal Agones Game Server Allocation object %v to anyPb, discarding mmfRequest %v: %v",
 						gsSet.server.allocSpec, gsSet.server.mmfParams, err)
 					continue
 				}
@@ -870,7 +878,7 @@ func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
 					Value: gsSet.server.allocSpec.Selectors[0].LabelSelector.MatchLabels[ex.MMFRequestHashKey],
 				})
 				if err != nil {
-					m.Log.Errorf("Unable to put mmfRequest hash into extensions, discarding mmfRequest %v: %v",
+					gLogger.Errorf("Unable to put mmfRequest hash into extensions, discarding mmfRequest %v: %v",
 						gsSet.server.mmfParams, err)
 					continue
 				}
@@ -1049,8 +1057,16 @@ func (d *MockDirector) Run(ctx context.Context) {
 		requests := d.GSManager.GetMMFParams()
 		for _, reqPb := range requests {
 			wg.Add(1)
-			logger.Debugf("Kicking off %v MMFs for Profile '%s' with %v pools",
-				len(reqPb.GetMmfs()), reqPb.GetProfile().GetName(), len(reqPb.GetProfile().GetPools()))
+
+			mmfLogFields := logrus.Fields{
+				"num_mmfs":     len(reqPb.GetMmfs()),
+				"profile_name": reqPb.GetProfile().GetName(),
+				"num_pools":    len(reqPb.GetProfile().GetPools()),
+			}
+			for _, mmf := range reqPb.GetMmfs() {
+				mmfLogFields[mmf.GetName()] = mmf.GetHost()
+			}
+			logger.WithFields(mmfLogFields).Debug("kicking off MMFs")
 
 			// Add this request to the list of pending requests, indexed by hash.
 			mmfReqHash, err := ex.String(reqPb.Profile.GetExtensions(), ex.MMFRequestHashKey)
@@ -1120,7 +1136,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// matchmaker because we don't like them or don't have available
 			// servers to host the sessions right now.
 			if rand.Intn(100) <= 1 {
-				mLogger.Error("[TEST] this match randomly selected to be rejected")
+				mLogger.Warn("[TEST] this match randomly selected to be rejected")
 				rejectMatch(match)
 				continue
 			}

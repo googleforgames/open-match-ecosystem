@@ -142,7 +142,7 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 	}
 
 	// Successful ticket creation
-	logger.Debugf("CreateTicket %v complete", resPb.TicketId)
+	logger.Tracef("CreateTicket %v complete", resPb.TicketId)
 	return resPb.TicketId, err
 }
 
@@ -223,7 +223,7 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 
 				// HTTP version of the gRPC ActivateTickets() call that we want to retry with exponential backoff and jitter
 				activateTicketCall := func() error {
-					logger.Tracef("!! %v Tix awaiting activation", len(ticketsAwaitingActivation))
+					logger.Tracef("%v Tix awaiting activation", len(ticketsAwaitingActivation))
 					resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets:activate", req)
 					// TODO: In reality, the error has details fields, telling us which ticket couldn't
 					// be activated, but we're not processing those or passing them on yet, we just act as
@@ -275,6 +275,7 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	logger := rc.Log.WithFields(logrus.Fields{
 		"component": "open_match_client",
 		"operation": "proxy_InvokeMatchmakingFunctions",
+		"url":       rc.Cfg.GetString("OM_CORE_ADDR") + "/matches:fetch",
 	})
 
 	// Have to cancel the context to tell the om-core server we're done reading from the stream.
@@ -296,13 +297,10 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/matches:fetch", req)
 	if err != nil {
 		logger.Errorf("InvokeMatchmakingFunction call failed: %v", err)
+	} else if resp != nil && resp.StatusCode != http.StatusOK {
+		logger.Errorf("InvokeMatchmakingFunction call failed: %v", resp.StatusCode)
 	} else {
 		logger.Tracef("InvokeMatchmakingFunction call successful: %v", resp.StatusCode)
-
-		// Check for a successful HTTP status code
-		if resp.StatusCode != http.StatusOK {
-			logger.Fatalf("Request failed with status: %s", resp.Status)
-		}
 
 		// Process the result stream
 		for {

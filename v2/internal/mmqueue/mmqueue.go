@@ -57,7 +57,10 @@ type ClientRequest struct {
 // Run the matchmaker queue, asynchronously queueing tickets and
 // activating them.
 func (q *MatchmakerQueue) Run(ctx context.Context) {
-	logger := q.Log.WithFields(logrus.Fields{"component": "matchmaking_queue"})
+	logger := q.Log.WithFields(logrus.Fields{
+		"component": "matchmaking_queue",
+		"operation": "ticket_creation_loop",
+	})
 
 	// Var init
 	ticketIdsToActivate := make(chan string)
@@ -69,7 +72,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	slots := make(chan struct{}, q.Cfg.GetInt("MAX_CONCURRENT_TICKET_CREATIONS"))
 
 	// Generate i tickets every second for j seconds
-	logger.Debugf("Processing queued tickets")
+	logger.Debug("Processing queued tickets")
 	go func() {
 
 		// Loop forever
@@ -77,6 +80,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 			// Block until one of the MAX_CONCURRENT_TICKET_CREATIONS slots is available
 			slots <- struct{}{}
 
+			logger.Trace("waiting for a new ticket to enter the queue")
 			// Block until a client request is in the channel
 			request := <-q.ClientRequestChan
 
@@ -107,10 +111,6 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 			<-slots
 		}
 
-		//logger.Infof("%02d/%02d: %v ticket queue attempts, active/lifetime %4d/%4d",
-		//	q.Cfg.GetInt("NUM_TICKET_CREATION_CYCLES")-j+1, j,
-		//	q.Cfg.GetInt("NUM_TICKETS_PER_CYCLE"),
-		//	len(syncMapDump(q.Tickets)), numTixCreated.Load())
 	}()
 
 	// activate pending tickets.
@@ -144,6 +144,7 @@ func (q *MatchmakerQueue) proxyCreateTicket(ctx context.Context, ticket *pb.Tick
 		"component": "matchmaking_queue",
 		"operation": "proxy_CreateTicket",
 	})
+	logger.Trace("creating ticket")
 
 	// Here is where your matchmaker would make additional calls to your
 	// game platform services to add additional matchmaking attributes.
@@ -155,8 +156,6 @@ func (q *MatchmakerQueue) proxyCreateTicket(ctx context.Context, ticket *pb.Tick
 		ticket.Attributes.DoubleArgs = make(map[string]float64)
 	}
 	ticket.Attributes.DoubleArgs["mmr"] = mmr
-
-	logger.Warnf("ticket: %v", ticket)
 
 	// With all matchmaking attributes collected from the client and the
 	// game backend services, we're now ready to put the ticket in open match.
@@ -175,7 +174,7 @@ func (q *MatchmakerQueue) proxyCreateTicket(ctx context.Context, ticket *pb.Tick
 
 	if err == nil {
 		// Log successful ticket creation
-		logger.Debugf("CreateTicket %v complete", id)
+		logger.Debugf("CreateTicket %v successful", id)
 	}
 	return id, err
 }

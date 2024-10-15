@@ -23,9 +23,11 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -33,10 +35,12 @@ import (
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/internal/extensions"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 	"open-match.dev/open-match-ecosystem/v2/internal/mmqueue"
@@ -49,6 +53,30 @@ var (
 	cycleStatus       string
 	cfg               = viper.New()
 	tickets           sync.Map
+	mmfFifo           = &pb.MatchmakingFunctionSpec{
+		Name: "FIFO",
+		Type: pb.MatchmakingFunctionSpec_GRPC,
+	}
+	backfillMMFs, _ = anypb.New(&pb.MmfRequest{Mmfs: []*pb.MatchmakingFunctionSpec{mmfFifo}})
+	soloduel        = &gsdirector.GameMode{
+		Name:  "SoloDuel",
+		MMFs:  []*pb.MatchmakingFunctionSpec{mmfFifo},
+		Pools: map[string]*pb.Pool{"all": gsdirector.EveryTicket},
+		ExtensionParams: extensions.Combine(extensions.AnypbIntMap(map[string]int32{
+			"desiredNumRosters": 1,
+			"desiredRosterLen":  4,
+			"minRosterLen":      2,
+		}), map[string]*anypb.Any{
+			extensions.MMFRequestKey: backfillMMFs,
+		}),
+	}
+	fleetConfig = map[string]map[string]map[string][]*gsdirector.GameMode{
+		"APAC": map[string]map[string][]*gsdirector.GameMode{
+			"JP_Tokyo": map[string][]*gsdirector.GameMode{
+				"asia-northeast1-a": []*gsdirector.GameMode{soloduel},
+			},
+		},
+	}
 )
 
 func main() {
@@ -63,7 +91,6 @@ func main() {
 	cfg := viper.New()
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
-	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 20)
 	cfg.SetDefault("PORT", 8081)
 
 	// Connection config.
@@ -78,6 +105,10 @@ func main() {
 	// InvokeMatchmaking Function config
 	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)                               // Default is essentially forever
 	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", math.MaxInt32) // Exit if consequtive matchmaking cycles come back empty
+
+	// MMF config
+	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
+	cfg.SetDefault("SOLODUEL_PORT", "50091")
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -120,8 +151,11 @@ func main() {
 		Cfg: cfg,
 		Log: log,
 	}
+
 	// Initialize the game server manager used by the director
-	err := d.GSManager.Init(gsdirector.FleetConfig)
+	mmfFifo.Host = cfg.GetString("SOLODUEL_ADDR")
+	mmfFifo.Port = cfg.GetInt32("SOLODUEL_PORT")
+	err := d.GSManager.Init(fleetConfig)
 	if err != nil {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}
@@ -147,10 +181,13 @@ func main() {
 	// call, and matches returned.
 	go d.Run(ctx)
 
-	// Basic default handler that just returns the current matchmaking progress status as a string.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// Handler to manually insert 1 test ticket into the queue.
+	http.HandleFunc("/tickets", func(w http.ResponseWriter, r *http.Request) {
 
-		// Make a channel on which the queue will return its http.Status result
+		// Make a channel on which the queue will return its http.Status
+		// result.  In a real matchmaker, you need to keep this channel and
+		// process the status result in a way that makes sense to send back to
+		// your game client.
 		resultChan := make(chan int)
 		q.ClientRequestChan <- &mmqueue.ClientRequest{
 			ResultChan: resultChan,
@@ -158,24 +195,124 @@ func main() {
 				// In a real game client, you'd probably use whatever communication
 				// protocol/format (JSON string, binary encoding, a custom format,
 				// etc) your game engine or dev kit encourages, and parse that data
-				// from the http.Request into the Open Match protobuf `ticket`
+				// from the http.Request 'r' into the Open Match protobuf `ticket`
 				// protobuf here.
 				//
-				// This example just makes an empty ticket.
-				//
-				// This ticket can only appear in Pools with a single
-				// CreationTimeFilter, as they have no other attributes to
-				// match against (CreationTime is created by Open Match upon
-				// ticket creation).
-				ticket := &pb.Ticket{}
-				// TODO: remove this line once the test framework is trued up
-				ticket = gameclient.Simple(ctx)
-				return ticket
+				// This example uses the provided internal library to generate a simple
+				// ticket with a few example attributes for testing.
+
+				// TODO: replace the gameclient.Simple() call with your own code to
+				// process the request 'r' into an Open Match *pb.Ticket.
+				return gameclient.Simple(ctx)
 			}(r),
 		}
 
 		// Write the http.Status code returned by the queue
 		w.WriteHeader(<-resultChan)
+	})
+
+	// Asynchronous goroutine that loops forever, attempting to queue
+	// 'tixPerSec' number of tickets each second. Update the tps by sending an
+	// http GET to /tps/<NUM> as per the handler below.
+	tpsLogger := logger.WithFields(logrus.Fields{
+		"component": "generate_tickets",
+	})
+	var tpsMutex sync.Mutex
+	tixPerSec := 0
+	go func() {
+		for {
+
+			// Every second we'll update our target tps.  This can be updated
+			// concurrently by http requests, so use a mutex.
+			tpsMutex.Lock()
+			tps := tixPerSec
+			tpsMutex.Unlock()
+
+			// Channel where we will put one struct for each ticket we want to create this second.
+			tq := make(chan struct{})
+
+			// Use a wait group to wait for the deadline to be reached.
+			var wg sync.WaitGroup
+			wg.Add(1)
+
+			// Loop for 1 second, making as many tickets as we can, up to the requested TPS.
+			tpsLogger.Trace("generating tickets until deadline")
+			go func() {
+				defer wg.Done()
+
+				// Start a new cycle after 1 second, whether we queued the requested TPS or not.
+				deadline := time.NewTimer(1 * time.Second)
+
+				numTixQueued := 0
+				for {
+					select {
+					case _, ok := <-tq:
+						if ok {
+							// There are still structs in the channel representing tickets we want
+							// created.
+
+							q.ClientRequestChan <- &mmqueue.ClientRequest{
+								// Make a channel on which the queue will return
+								// its http.Status result (not used in this example)
+								ResultChan: make(chan int),
+								// Use the provided internal library to generate a simple
+								// ticket with a few example attributes for testing.
+								Ticket: gameclient.Simple(ctx),
+							}
+							numTixQueued++
+						}
+					case <-deadline.C:
+						// deadline reached; return from this function and call the deferred
+						// waitgroup Done(), which signals that we've processed
+						// as many tickets as we can this second
+						tpsLogger.Tracef("DEADLINE EXCEEDED: %v/%v tps (achieved/requested)", numTixQueued, tps)
+						return
+					}
+				}
+			}()
+
+			// Simple goroutine to put one struct in the channel for every ticket
+			// we want to generate this second.
+			go func() {
+				for i := tps; i > 0; i-- {
+					tq <- struct{}{}
+				}
+				close(tq)
+			}()
+
+			// Wait for the 1 second deadline.
+			wg.Wait()
+		}
+
+	}()
+
+	// Handler to update the (best effort) number of test tickets we want to
+	// generate and put into the queue per second. If the requested TPS is more
+	// than the matchmaker can manage in a second, it will do as many as it
+	// can. Set it to 0 to stop automatically creating tickets.
+	http.HandleFunc("/tps/{tixPerSec}", func(w http.ResponseWriter, r *http.Request) {
+
+		// Attempt to convert requested TPS string into an integer
+		rTPS, err := strconv.Atoi(r.PathValue("tixPerSec"))
+		if err != nil {
+			// Couldn't convert to int; maybe a typo in the http request?
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		// Hard cap of 10k per second to protect against mistyped http requests
+		if rTPS > 10000 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// Update tixPerSec. This is read in the asynch goroutine above, so
+		// protect it with a mutex.
+		tpsMutex.Lock()
+		tixPerSec = rTPS
+		tpsMutex.Unlock()
+
+		tpsLogger.Infof("TPS set to %v", rTPS)
+		w.WriteHeader(http.StatusOK)
 	})
 
 	// Start http server so this application can be run on serverless platforms.
