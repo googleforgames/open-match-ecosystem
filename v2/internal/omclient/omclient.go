@@ -33,9 +33,32 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/protobuf/encoding/protojson"
 )
+
+type idTokenSource struct {
+	TokenSource oauth2.TokenSource
+}
+
+func (s *idTokenSource) Token() (*oauth2.Token, error) {
+	token, err := s.TokenSource.Token()
+	if err != nil {
+		return nil, err
+	}
+
+	idToken, ok := token.Extra("id_token").(string)
+	if !ok {
+		return nil, fmt.Errorf("token did not contain an id_token")
+	}
+
+	return &oauth2.Token{
+		AccessToken: idToken,
+		TokenType:   "Bearer",
+		Expiry:      token.Expiry,
+	}, nil
+}
 
 type RestfulOMGrpcClient struct {
 	Client      *http.Client
@@ -389,17 +412,23 @@ func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, u
 			// Create a TokenSource if none exists.
 			rc.tokenSource, err = idtoken.NewTokenSource(ctx, url)
 			if err != nil {
-				err = fmt.Errorf("Cloud Run service account authentication requires token source, but couldn't get one. Trying to continue without SA auth. idtoken.NewTokenSource: %w", err)
+				logger.Errorf("Cloud Run service account authentication requires token source, but couldn't get one. Trying to continue without SA auth. idtoken.NewTokenSource: %v", err)
 			}
 		}
 
-		// Retrieve an identity token. Will reuse tokens until refresh needed.
-		token, err := rc.tokenSource.Token()
+	} else {
+		gts, err := google.DefaultTokenSource(ctx)
 		if err != nil {
-			err = fmt.Errorf("Cloud Run service account authentication requires a token, but couldn't get one. Trying to continue without SA auth. TokenSource.Token: %w", err)
+			logger.Errorf("google.DefaultTokenSource failed %v", err)
 		}
-		token.SetAuthHeader(req)
+		rc.tokenSource = oauth2.ReuseTokenSource(nil, &idTokenSource{TokenSource: gts})
 	}
+	// Retrieve an identity token. Will reuse tokens until refresh needed.
+	token, err := rc.tokenSource.Token()
+	if err != nil {
+		logger.Errorf("Cloud Run service account authentication requires a token, but couldn't get one. Trying to continue without SA auth. TokenSource.Token: %v", err)
+	}
+	token.SetAuthHeader(req)
 
 	// Log all request headers if debug logging (slow)
 	if logrus.IsLevelEnabled(logrus.DebugLevel) {
