@@ -108,7 +108,7 @@ func main() {
 
 	// MMF config
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
-	cfg.SetDefault("SOLODUEL_PORT", "50091")
+	cfg.SetDefault("SOLODUEL_PORT", "")
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",

@@ -4,7 +4,7 @@
 #
 # or
 # gcloud builds submit --async \
-#   --substitutions=COMMIT_SHA=latest,_JOB_NAME=matchmaker-example,_GOOGLE_BUILDABLE=./examples/matchmaker
+#  --substitutions=COMMIT_SHA=latest,_JOB_NAME=soloduel,_GOOGLE_BUILDABLE=./examples/mmf/
 substitutions:
   _ARTIFACT_REGISTRY_URI: asia-northeast1-docker.pkg.dev/open-match-dev/open-match
   _JOB_NAME: matchmaker-example 

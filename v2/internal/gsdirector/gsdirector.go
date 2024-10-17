@@ -453,54 +453,6 @@ func (m *MockAgonesIntegration) processGameServerUpdates() {
 				pLogger.Errorf("Failure to generate new Agones Allocation Spec from provided MmfRequests: %v", err)
 			}
 
-			//// Add JSON string of this Mmf Request to the list of requests to annotate this game server with.
-			//mpa := &mmfParametersAnnotation{mmfParams: make([]string, len(update.mmfParams))}
-
-			//for _, mmfParam := range update.mmfParams {
-			//	// Marshal this mmf request to a JSON string
-			//	mmfParamJSON, err := protojson.Marshal(mmfParam)
-			//	if err != nil {
-			//		m.Log.Errorf("Failed to marshal MMF parameters into JSON, discarding: %v", err)
-			//		continue
-			//	}
-
-			//	// Add this set of matchmaking parameters
-			//	mpa.mmfParams = append(mpa.mmfParams, string(mmfParamJSON[:]))
-			//}
-
-			//// Convert the mmfParams to JSON, and get a hash of that JSON
-			//mmfParamsAnnotationJSON, err := json.Marshal(mpa)
-			//if err != nil {
-			//	m.Log.Errorf("Unable to marshal MmfRequests annotation to JSON: %v", err)
-			//	continue
-			//}
-			//xxHash = xxh3.Hash128Seed(mmfParamsAnnotationJSON, 0).Bytes()
-
-			//// Make an allocation spec that will match a game server with a
-			//// label under the key `ex.MMFRequestKey` with a value equal to the
-			//// hash of the new MMF Requests, and that will add the MMF Requests
-			//// as an annotation to the game server upon allocation.
-			//newAllocatorSpec := &allocationv1.GameServerAllocationSpec{
-			//	Selectors: []allocationv1.GameServerSelector{
-			//		allocationv1.GameServerSelector{
-			//			LabelSelector: metav1.LabelSelector{
-			//				// TODO: move to lists, and have one hash for every mmfRequest
-			//				MatchLabels: map[string]string{
-			//					ex.MMFRequestKey: hex.EncodeToString(xxHash[:]),
-			//				},
-			//			},
-			//		},
-			//	},
-			//	MetaPatch: allocationv1.MetaPatch{
-			//		// Attach the matchmaking request that can be used to
-			//		// make matches this server wants to host as a k8s
-			//		// annotation.
-			//		Annotations: map[string]string{
-			//			ex.MMFRequestKey: string(mmfParamsAnnotationJSON[:]),
-			//		},
-			//	},
-			//}
-
 			// Now hash the allocation spec we just created to use as a key.
 			newAllocatorSpecJSONBytes, err := json.Marshal(newAllocatorSpec)
 			if err != nil {
@@ -687,34 +639,6 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]map[strin
 					},
 				}
 
-				// Now we have all the parameters we need to matchmake for this
-				// fleet.  This mock does not actually create Agones Fleets. In
-				// a real integration you'd need some code that creates Fleets
-				// in kubernetes, and specifies the MmfRequest in the Game
-				// Server Template Spec, so all game servers made by fleet
-				// scaling events will have the proper MmfRequest attached to
-				// them. Something like this:
-				//
-				//thisFleet := &agonesv1.Fleet{
-				//	Spec: agonesv1.FleetSpec{
-				//		Template: agonesv1.GameServerTemplateSpec{
-				//			ObjectMeta: metav1.ObjectMeta{
-				//				// Attach the matchmaking profiles for this fleet's
-				//				// game modes to the fleet as a k8s annotation.
-				//				Annotations: map[string]string{
-				//					ex.MMFRequestKey: string(mmfParamsJSON[:]),
-				//				},
-				// TODO: move to lists, and have one hash for each mmfRequest
-				//				Labels: map[string]string{
-				//					ex.MMFRequestHashKey: mmfParamsHash,
-
-				//				},
-				//			},
-				//		},
-				//	},
-				//}
-				// createFleetOnCluster(thisCluster, thisFleet)
-
 				// Hash the agones allocation spec and store it in a map by its
 				// hash for later lookup
 				allocJSONBytes, err := json.Marshal(mGSSet.server.allocSpec)
@@ -747,7 +671,6 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]map[strin
 // on game server allocation.
 func (m *MockAgonesIntegration) Allocate(allocationSpecJSON string, match *pb.Match) (connString string) {
 	// Here is where your backend would do any additional prep tasks for server allocation in Agones
-	m.Log.Debugf("Allocating server for match %v", match.GetId())
 
 	var ok bool
 	// Decorative closure to make it easier to see what is being done within the mutex lock.
@@ -884,17 +807,6 @@ func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
 				}
 				extensions[ex.MMFRequestHashKey] = mmfRequestHash
 
-				//	return &allocationv1.GameServerAllocationSpec{
-				//		Selectors: []allocationv1.GameServerSelector{
-				//			allocationv1.GameServerSelector{
-				//				LabelSelector: metav1.LabelSelector{
-				//					// TODO: move to lists, and have one hash for every mmfRequest
-				//					MatchLabels: map[string]string{
-				//						ex.MMFRequestHashKey: hex.EncodeToString(xxHash[:]),
-				//					},
-				//				},
-				//			},
-				//		},
 				requests = append(requests, &pb.MmfRequest{
 					Mmfs: request.GetMmfs(),
 					Profile: &pb.Profile{
