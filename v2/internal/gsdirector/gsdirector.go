@@ -838,32 +838,14 @@ type MockDirector struct {
 	OmClient                 *omclient.RestfulOMGrpcClient
 	Cfg                      *viper.Viper
 	Log                      *logrus.Logger
-	assignments              map[string]string
+	AssignmentsChan          chan *pb.Roster
 	GSManager                GameServerManager
 	pendingMmfRequestsByHash map[string]*pb.MmfRequest
-	assignmentMutex          sync.RWMutex
-}
-
-// GetAssignments() returns a map containing the connection string for every
-// input ticketID it finds in the in-memory map of assignments.
-func (d *MockDirector) GetAssignments(ticketIds []string) map[string]string {
-	out := make(map[string]string)
-	// Get Assignments can be called asynchronously, so we need to use a mutex when reading
-	// from the assignments map.
-	d.assignmentMutex.RLock()
-	for _, id := range ticketIds {
-		if connString, exists := d.assignments[id]; exists {
-			out[id] = connString
-		}
-	}
-	d.assignmentMutex.RUnlock()
-	return out
 }
 
 func (d *MockDirector) Run(ctx context.Context) {
 
 	// Var init
-	d.assignments = make(map[string]string)
 	d.pendingMmfRequestsByHash = make(map[string]*pb.MmfRequest)
 
 	// Add fields to structured logging for this function
@@ -1124,15 +1106,10 @@ func (d *MockDirector) Run(ctx context.Context) {
 			if connString != "" {
 				d.Log.Tracef("Match session assigned to game server %v", connString)
 
-				// Assignments can be read asynchronously, so we must use a mutex
-				// when updating the assignment map.
-				d.assignmentMutex.Lock()
+				// Stream out the assignments to the mmqueue
 				for _, roster := range match.GetRosters() {
-					for _, ticket := range roster.GetTickets() {
-						d.assignments[ticket.GetId()] = connString
-					}
+					d.AssignmentsChan <- roster
 				}
-				d.assignmentMutex.Unlock()
 			} else {
 				// No valid connection string returned from the game server
 				// manager, there must be an issue. Put these tickets back into the

@@ -47,6 +47,7 @@ type MatchmakerQueue struct {
 	Log               *logrus.Logger
 	Tickets           sync.Map
 	ClientRequestChan chan *ClientRequest
+	AssignmentsChan   chan *pb.Roster
 }
 
 type ClientRequest struct {
@@ -118,7 +119,32 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		for {
 			ctx := context.WithValue(ctx, "type", "activate")
 			q.OmClient.ActivateTickets(ctx, ticketIdsToActivate)
+			// TODO: actually tune this sleep to use exp BO + jitter
 			time.Sleep(1 * time.Second)
+		}
+	}()
+
+	// process incoming assignments.
+	go func() {
+		aLogger := q.Log.WithFields(logrus.Fields{
+			"component": "matchmaking_queue",
+			"operation": "ticket_assignment",
+		})
+
+		var assignment string
+		for roster := range q.AssignmentsChan {
+			assignment = roster.GetAssignment().GetConnection()
+			for _, ticket := range roster.GetTickets() {
+				// TODO: in reality, this is where your matchmaking queue would
+				// return the assignment to the game client. This sample
+				// instead just logs the assignment.
+				aLogger.Debugf("Received ticket %v assignment: %v", ticket.GetId(), assignment)
+				// Stop tracking this ticket; it's matchmaking is complete.
+				// Your matchmaker may wish to instead keep this for a time (in
+				// case the game client needs to request the same assignment
+				// again later).
+				q.Tickets.Delete(ticket.GetId())
+			}
 		}
 	}()
 }

@@ -126,6 +126,8 @@ func main() {
 	logger := log.WithFields(logrus.Fields{"application": "matchmaker"})
 	logger.Debugf("%v cycles", cfg.GetInt("NUM_MM_CYCLES"))
 
+	assignmentsChan := make(chan *pb.Roster)
+
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
 		OmClient: &omclient.RestfulOMGrpcClient{
@@ -136,6 +138,7 @@ func main() {
 		Cfg:               cfg,
 		Log:               log,
 		ClientRequestChan: make(chan *mmqueue.ClientRequest),
+		AssignmentsChan:   assignmentsChan,
 	}
 
 	// Initialize the director
@@ -148,8 +151,9 @@ func main() {
 		GSManager: &gsdirector.MockAgonesIntegration{
 			Log: log,
 		},
-		Cfg: cfg,
-		Log: log,
+		Cfg:             cfg,
+		Log:             log,
+		AssignmentsChan: assignmentsChan,
 	}
 
 	// Initialize the game server manager used by the director
