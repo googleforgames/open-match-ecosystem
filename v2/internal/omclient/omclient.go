@@ -389,14 +389,16 @@ func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, u
 			// Create a TokenSource if none exists.
 			rc.tokenSource, err = idtoken.NewTokenSource(ctx, url)
 			if err != nil {
-				err = fmt.Errorf("Cloud Run service account authentication requires token source, but couldn't get one. Trying to continue without SA auth. idtoken.NewTokenSource: %w", err)
+				err = fmt.Errorf("Cloud Run service account authentication requires token source, but couldn't get one. idtoken.NewTokenSource: %w", err)
+				return nil, err
 			}
 		}
 
 		// Retrieve an identity token. Will reuse tokens until refresh needed.
 		token, err := rc.tokenSource.Token()
 		if err != nil {
-			err = fmt.Errorf("Cloud Run service account authentication requires a token, but couldn't get one. Trying to continue without SA auth. TokenSource.Token: %w", err)
+			err = fmt.Errorf("Cloud Run service account authentication requires a token, but couldn't get one. TokenSource.Token: %w", err)
+			return nil, err
 		}
 		token.SetAuthHeader(req)
 	}
