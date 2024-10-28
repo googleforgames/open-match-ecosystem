@@ -87,6 +87,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 
 			// Asynchronous concurrent ticket creation
 			go func(request *ClientRequest) {
+				defer close(request.ResultChan)
 
 				// proxyCreateTicket implements retries exp bo + jitter
 				id, err := q.proxyCreateTicket(ctx, request.Ticket)

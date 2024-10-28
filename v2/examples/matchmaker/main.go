@@ -255,14 +255,22 @@ func main() {
 							// There are still structs in the channel representing tickets we want
 							// created.
 
+							rChan := make(chan int)
 							q.ClientRequestChan <- &mmqueue.ClientRequest{
 								// Make a channel on which the queue will return
 								// its http.Status result (not used in this example)
-								ResultChan: make(chan int),
+								ResultChan: rChan,
 								// Use the provided internal library to generate a simple
 								// ticket with a few example attributes for testing.
 								Ticket: gameclient.Simple(ctx),
 							}
+
+							// TODO: in a real matchmaker, you'd want to do something with the result; here
+							// we simply receive it and discard it.
+							go func() {
+								_ = <-rChan
+							}()
+
 							numTixQueued++
 						}
 					case <-deadline.C:
