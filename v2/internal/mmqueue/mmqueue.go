@@ -118,7 +118,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	// activate pending tickets.
 	go func() {
 		for {
-			ctx := context.WithValue(ctx, "type", "activate")
+			ctx := context.WithValue(ctx, "activationType", "activate")
 			q.OmClient.ActivateTickets(ctx, ticketIdsToActivate)
 			// TODO: actually tune this sleep to use exp BO + jitter
 			time.Sleep(1 * time.Second)

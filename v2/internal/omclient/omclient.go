@@ -196,7 +196,7 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 				// the calling function put into the context when
 				// logging errors (to aid debugging)
 				callerFromContext := func() string {
-					ts, ok := ctx.Value("type").(string)
+					ts, ok := ctx.Value("activationType").(string)
 					if !ok {
 						logger.Error("unable to get caller type from context")
 						return "undefined"
@@ -231,13 +231,13 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 					if err != nil {
 						logger.WithFields(logrus.Fields{
 							"caller": callerFromContext,
-						}).Errorf("ActivateTickets attempt failed: %w", err)
+						}).Errorf("ActivateTickets attempt failed: %v", err)
 
 						return err
 					} else if resp != nil && resp.StatusCode != http.StatusOK { // HTTP error code
 						logger.WithFields(logrus.Fields{
 							"caller": callerFromContext,
-						}).Errorf("ActivateTickets attempt failed: %w", fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode))
+						}).Errorf("ActivateTickets attempt failed: %v", fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode))
 						return fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
 					}
 					return nil
@@ -254,7 +254,7 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 				if err != nil {
 					logger.WithFields(logrus.Fields{
 						"caller": callerFromContext,
-					}).Errorf("ActivateTickets failed: %w", err)
+					}).Errorf("ActivateTickets failed: %v", err)
 				}
 				logger.WithFields(logrus.Fields{
 					"caller": callerFromContext,
@@ -389,7 +389,7 @@ func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, u
 			// Create a TokenSource if none exists.
 			rc.tokenSource, err = idtoken.NewTokenSource(ctx, url)
 			if err != nil {
-				err = fmt.Errorf("Cloud Run service account authentication requires token source, but couldn't get one. idtoken.NewTokenSource: %w", err)
+				err = fmt.Errorf("Cloud Run service account authentication requires token source, but couldn't get one. idtoken.NewTokenSource: %v", err)
 				return nil, err
 			}
 		}
@@ -397,7 +397,7 @@ func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, u
 		// Retrieve an identity token. Will reuse tokens until refresh needed.
 		token, err := rc.tokenSource.Token()
 		if err != nil {
-			err = fmt.Errorf("Cloud Run service account authentication requires a token, but couldn't get one. TokenSource.Token: %w", err)
+			err = fmt.Errorf("Cloud Run service account authentication requires a token, but couldn't get one. TokenSource.Token: %v", err)
 			return nil, err
 		}
 		token.SetAuthHeader(req)

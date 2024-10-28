@@ -891,6 +891,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 		//
 		// TODO: make timeout configurable
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		ctx = context.WithValue(ctx, "activationType", "re-activate")
 
 		// Make a channel that collects all the results channels for all the
 		// concurrent calls we'll make to OM.
