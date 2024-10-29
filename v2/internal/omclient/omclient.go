@@ -35,6 +35,7 @@ import (
 	"golang.org/x/oauth2"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type RestfulOMGrpcClient struct {
@@ -45,13 +46,11 @@ type RestfulOMGrpcClient struct {
 }
 
 // CreateTicket Example
-// Your platform services layer should take the matchmaking request (in this
-// example, we assume it is from a game client, but it could come via another
-// of your game platform services as well), add attributes your platform
-// services have authority over (ex: MMR, ELO, inventory, etc), then call Open
-// Match core on the client's behalf to make a matchmaking ticket. In this sense,
-// your platform services layer acts as a 'proxy' for the player's game client
-// from the viewpoint of Open Match.
+// Your platform services layer should take the matchmaking request, add
+// attributes your platform services have authority over (ex: MMR, ELO,
+// inventory, etc), then call Open Match core on the client's behalf to make a
+// matchmaking ticket. In this sense, Open Match sees your platform services
+// layer as a 'proxy' for the player's game client.
 func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Ticket) (string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -84,15 +83,16 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 	// HTTP version of the gRPC CreateTicket() call
 	resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets", buf)
 
-	// Include headers in structured loggerging when debugging.
+	// Include headers in structured logging when using trace log level [slow]
 	headerFields := logrus.Fields{}
-	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+	if logrus.IsLevelEnabled(logrus.TraceLevel) {
 		for key, value := range resp.Header {
 			headerFields[key] = value
 		}
 	}
 	logger = logger.WithFields(headerFields)
 
+	// Check for failures
 	if resp != nil && resp.StatusCode != http.StatusOK { // HTTP error code
 		err := fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
 		logger.WithFields(logrus.Fields{
@@ -101,7 +101,6 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 		//TODO: switch resp.Header?
 		return "", err
 	}
-
 	if err != nil { // HTTP library error
 		logger.WithFields(logrus.Fields{
 			"CreateTicketsRequest": reqPb,
@@ -133,7 +132,6 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 		}).Errorf("cannot unmarshal http response body back into protobuf")
 		return "", err
 	}
-
 	if resPb == nil {
 		// Mark as a permanent error so the backoff library doesn't retry this REST call
 		err := backoff.Permanent(errors.New("CreateTicket returned empty result"))
@@ -359,10 +357,9 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	}
 }
 
-// Post Makes an HTTP request at the given url+path, marshalling the
-// provided protobuf in the pbReq argument into the HTTP request JSON body (for
-// use with grpc gateway). It attempts to transparently handle TLS if the target
-// server requires it.
+// Post makes an HTTP request at the given url+path, and a byte buffer of the
+// data to POST.  It attempts to transparently handle TLS if the target server
+// requires it.
 func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, url string, path string, reqBuf []byte) (*http.Response, error) {
 	// Add the url as a structured logging field when debug logging is enabled
 	postLogger := logger.WithFields(logrus.Fields{
@@ -403,8 +400,8 @@ func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, u
 		token.SetAuthHeader(req)
 	}
 
-	// Log all request headers if debug logging (slow)
-	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+	// Log all request headers if using trace logging (slow)
+	if logrus.IsLevelEnabled(logrus.TraceLevel) {
 		headerFields := logrus.Fields{}
 		for key, value := range req.Header {
 			headerFields[key] = value
@@ -436,11 +433,30 @@ func readAllBody(resp http.Response, logger *logrus.Entry) ([]byte, error) {
 	return body, err
 }
 
-func syncMapDump(sm *sync.Map) map[string]interface{} {
-	out := map[string]interface{}{}
-	sm.Range(func(key, value interface{}) bool {
-		out[fmt.Sprint(key)] = value
-		return true
+// ValidateConnection can be used to check that the RestfulOMGrpcClient can
+// send requests to the provide Open Match URL
+func (rc *RestfulOMGrpcClient) ValidateConnection(ctx context.Context, url string) error {
+
+	// Make a dummy ticket that will immediately expire and matches no filters.
+	buf, err := protojson.Marshal(&pb.CreateTicketRequest{
+		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()},
 	})
-	return out
+	// Try to create the dummy ticket.
+	_, err = rc.Post(ctx,
+		rc.Log.WithFields(logrus.Fields{
+			"operation": "proxy_ValidateConnection",
+		}),
+		url, "/", buf)
+	return err
 }
+
+// syncMapDump can be uncommented and called to see the contents of a sync.Map
+// when debugging.
+//func syncMapDump(sm *sync.Map) map[string]interface{} {
+//	out := map[string]interface{}{}
+//	sm.Range(func(key, value interface{}) bool {
+//		out[fmt.Sprint(key)] = value
+//		return true
+//	})
+//	return out
+//}

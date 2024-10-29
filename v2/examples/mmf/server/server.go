@@ -39,7 +39,7 @@ import (
 
 var (
 	logfields = logrus.Fields{
-		"app":       "open_match",
+		"app":       "matchmaker",
 		"component": "matchmaking_function",
 		"function":  "server",
 	}

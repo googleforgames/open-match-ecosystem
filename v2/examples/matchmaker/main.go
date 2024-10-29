@@ -27,19 +27,19 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
-	"google.golang.org/protobuf/encoding/protojson"
+
 	"google.golang.org/protobuf/types/known/anypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/fifo"
+	mmfserver "open-match.dev/open-match-ecosystem/v2/examples/mmf/server"
 	"open-match.dev/open-match-ecosystem/v2/internal/extensions"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
@@ -89,8 +89,6 @@ func main() {
 
 	// Read config
 	cfg := viper.New()
-	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
-	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 	cfg.SetDefault("PORT", 8081)
 
 	// Connection config.
@@ -108,7 +106,7 @@ func main() {
 
 	// MMF config
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
-	cfg.SetDefault("SOLODUEL_PORT", "")
+	cfg.SetDefault("SOLODUEL_PORT", 50080)
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -164,12 +162,16 @@ func main() {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}
 
-	// TODO: move this into the omclient
-	//Check connection before spinning everything up.
-	buf, err := protojson.Marshal(&pb.CreateTicketRequest{
-		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()}, // Dummy ticket
-	})
-	_, err = d.OmClient.Post(ctx, logger, cfg.GetString("OM_CORE_ADDR"), "/", buf)
+	// FOR TESTING ONLY
+	// Run an in-process local mmf server. This approach will NOT scale to production workloads
+	// and should only be used for local development and testing your matching logic.
+	if cfg.GetString("SOLODUEL_ADDR") == "http://localhost" {
+		localTestMMF := fifo.NewWithLogger(log)
+		go mmfserver.StartServer(cfg.GetInt32("SOLODUEL_PORT"), localTestMMF, log)
+	}
+
+	//Check connection before spinning up the matchmaking queue
+	err = q.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
 	if err != nil {
 		logger.Errorf("OM Connection test failure: %v", err)
 		if strings.Contains(err.Error(), "connect: connection refused") {
@@ -177,10 +179,18 @@ func main() {
 			os.Exit(1)
 		}
 	}
-
 	// Start the ticket matchmaking queue. This is where tickets get processd and stored in OM2.
 	go q.Run(ctx)
 
+	//Check connection before spinning up the game server director
+	err = d.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
+	if err != nil {
+		logger.Errorf("OM Connection test failure: %v", err)
+		if strings.Contains(err.Error(), "connect: connection refused") {
+			logger.Fatal("Unrecoverable error. Is the OM_CORE_ADDR config set correctly?")
+			os.Exit(1)
+		}
+	}
 	// Start the director. This is where profiles get sent to the InvokeMMFs()
 	// call, and matches returned.
 	go d.Run(ctx)
@@ -215,89 +225,11 @@ func main() {
 		w.WriteHeader(<-resultChan)
 	})
 
+	// FOR TESTING ONLY
 	// Asynchronous goroutine that loops forever, attempting to queue
 	// 'tixPerSec' number of tickets each second. Update the tps by sending an
 	// http GET to /tps/<NUM> as per the handler below.
-	tpsLogger := logger.WithFields(logrus.Fields{
-		"component": "generate_tickets",
-	})
-	var tpsMutex sync.Mutex
-	tixPerSec := 0
-	go func() {
-		for {
-
-			// Every second we'll update our target tps.  This can be updated
-			// concurrently by http requests, so use a mutex.
-			tpsMutex.Lock()
-			tps := tixPerSec
-			tpsMutex.Unlock()
-
-			// Channel where we will put one struct for each ticket we want to create this second.
-			tq := make(chan struct{})
-
-			// Use a wait group to wait for the deadline to be reached.
-			var wg sync.WaitGroup
-			wg.Add(1)
-
-			// Loop for 1 second, making as many tickets as we can, up to the requested TPS.
-			tpsLogger.Trace("generating tickets until deadline")
-			go func() {
-				defer wg.Done()
-
-				// Start a new cycle after 1 second, whether we queued the requested TPS or not.
-				deadline := time.NewTimer(1 * time.Second)
-
-				numTixQueued := 0
-				for {
-					select {
-					case _, ok := <-tq:
-						if ok {
-							// There are still structs in the channel representing tickets we want
-							// created.
-
-							rChan := make(chan int)
-							q.ClientRequestChan <- &mmqueue.ClientRequest{
-								// Make a channel on which the queue will return
-								// its http.Status result (not used in this example)
-								ResultChan: rChan,
-								// Use the provided internal library to generate a simple
-								// ticket with a few example attributes for testing.
-								Ticket: gameclient.Simple(ctx),
-							}
-
-							// TODO: in a real matchmaker, you'd want to do something with the result; here
-							// we simply receive it and discard it.
-							go func() {
-								_ = <-rChan
-							}()
-
-							numTixQueued++
-						}
-					case <-deadline.C:
-						// deadline reached; return from this function and call the deferred
-						// waitgroup Done(), which signals that we've processed
-						// as many tickets as we can this second
-						tpsLogger.Tracef("DEADLINE EXCEEDED: %v/%v tps (achieved/requested)", numTixQueued, tps)
-						return
-					}
-				}
-			}()
-
-			// Simple goroutine to put one struct in the channel for every ticket
-			// we want to generate this second.
-			go func() {
-				for i := tps; i > 0; i-- {
-					tq <- struct{}{}
-				}
-				close(tq)
-			}()
-
-			// Wait for the 1 second deadline.
-			wg.Wait()
-		}
-
-	}()
-
+	go q.GenerateTestTickets(ctx)
 	// Handler to update the (best effort) number of test tickets we want to
 	// generate and put into the queue per second. If the requested TPS is more
 	// than the matchmaker can manage in a second, it will do as many as it
@@ -317,13 +249,10 @@ func main() {
 			return
 		}
 
-		// Update tixPerSec. This is read in the asynch goroutine above, so
-		// protect it with a mutex.
-		tpsMutex.Lock()
-		tixPerSec = rTPS
-		tpsMutex.Unlock()
+		// Update tixPerSec number, and generate tickets using the gameclient.Simple function.
+		q.SetTestTPS(rTPS, gameclient.Simple)
 
-		tpsLogger.Infof("TPS set to %v", rTPS)
+		logger.Infof("TPS set to %v", rTPS)
 		w.WriteHeader(http.StatusOK)
 	})
 

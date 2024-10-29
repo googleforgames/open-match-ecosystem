@@ -60,9 +60,9 @@ const (
 var (
 	// Default logger.
 	defaultLoggingFields = logrus.Fields{
-		"app":       "open_match",
+		"app":       "matchmaker",
 		"component": "matchmaking_function",
-		"function":  "fifo",
+		"strategy":  "fifo",
 	}
 	log = logrus.New()
 
@@ -94,7 +94,7 @@ func New() *mmfServer {
 // structured logging fields
 func NewWithLogger(l *logrus.Logger) *mmfServer {
 	return &mmfServer{
-		// use default logger.
+		// use default logging fields with provided logger.
 		logger: l.WithFields(defaultLoggingFields),
 	}
 }

@@ -1,3 +1,4 @@
+*.out
 examples/matchmaker/matchmaker
 examples/mmf/mmf
 examples/standalone/gsdirector/gsdirector

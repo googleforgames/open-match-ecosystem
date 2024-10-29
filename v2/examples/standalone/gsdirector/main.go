@@ -33,11 +33,9 @@ import (
 
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/types/known/timestamppb"
+
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
-	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
@@ -101,12 +99,8 @@ func main() {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}
 
-	// TODO: move this into the omclient
 	//Check connection before spinning everything up.
-	buf, err := protojson.Marshal(&pb.CreateTicketRequest{
-		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()}, // Dummy ticket
-	})
-	_, err = d.OmClient.Post(ctx, logger, cfg.GetString("OM_CORE_ADDR"), "/", buf)
+	err = d.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
 	if err != nil {
 		logger.Errorf("OM Connection test failure: %v", err)
 		if strings.Contains(err.Error(), "connect: connection refused") {

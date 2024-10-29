@@ -74,8 +74,7 @@ import (
 
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/types/known/timestamppb"
+
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
 	//soloduelServer "open-match.dev/functions/golang/soloduel"
@@ -126,14 +125,11 @@ func main() {
 		Cfg:               cfg,
 		Log:               log,
 		ClientRequestChan: make(chan *mmqueue.ClientRequest),
+		AssignmentsChan:   make(chan *pb.Roster),
 	}
 
-	// TODO: move this into the omclient
 	//Check connection before spinning everything up.
-	buf, err := protojson.Marshal(&pb.CreateTicketRequest{
-		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()}, // Dummy ticket
-	})
-	_, err = q.OmClient.Post(ctx, logger, cfg.GetString("OM_CORE_ADDR"), "/", buf)
+	err := q.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
 	if err != nil {
 		logger.Errorf("OM Connection test failure: %v", err)
 		if strings.Contains(err.Error(), "connect: connection refused") {
@@ -141,7 +137,6 @@ func main() {
 			os.Exit(1)
 		}
 	}
-
 	// Start the queue. This is where requests are processed and added to Open Match.
 	go q.Run(ctx)
 

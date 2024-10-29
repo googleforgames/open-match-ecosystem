@@ -850,6 +850,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 
 	// Add fields to structured logging for this function
 	logger := d.Log.WithFields(logrus.Fields{
+		"app":       "matchmaker",
 		"component": "game_server_director",
 		"operation": "matchmaking_loop",
 	})
