@@ -852,9 +852,8 @@ func (d *MockDirector) Run(ctx context.Context) {
 	logger := d.Log.WithFields(logrus.Fields{
 		"app":       "matchmaker",
 		"component": "game_server_director",
-		"operation": "matchmaking_loop",
 	})
-	logger.Tracef("Initializing loop directing matches to game servers")
+	logger.Tracef("Initializing game server director directing matches to game servers")
 
 	// local var init
 	ticketIdsToActivate := make(chan string, 10000)
@@ -862,9 +861,28 @@ func (d *MockDirector) Run(ctx context.Context) {
 	var proposedMatches []*pb.Match
 	var matches map[*pb.Match]string
 
+	// goroutine that runs for the lifetime of the game server director to
+	// re-activate rejected tickets so they appear in matchmaking pools again.
+	// We'll send all ticket ids from rejected matches to the
+	// ticketIdsToActivate channel.
+	go func() {
+		aLogger := logger.WithFields(logrus.Fields{
+			"operation": "ticket_reactivation",
+		})
+		aLogger.Trace("requesting re-activation of rejected tickets")
+
+		// request re-activation of rejected tickets.
+		atCtx := context.WithValue(ctx, "activationType", "re-activate")
+		d.OmClient.ActivateTickets(atCtx, ticketIdsToActivate)
+
+	}()
+
 	// Kick off main matchmaking loop
 	// Loop for the configured number of cycles
-	logger.Debugf("Beginning matchmaking cycle, %v cycles configured", d.Cfg.GetInt("NUM_MM_CYCLES"))
+	lLogger := logger.WithFields(logrus.Fields{
+		"operation": "matchmaking_loop",
+	})
+	lLogger.Debugf("Beginning matchmaking cycle, %v cycles configured", d.Cfg.GetInt("NUM_MM_CYCLES"))
 	for i := d.Cfg.GetInt("NUM_MM_CYCLES"); i > 0; i-- { // Main Matchmaking Loop
 
 		// Loop var init
@@ -892,7 +910,6 @@ func (d *MockDirector) Run(ctx context.Context) {
 		//
 		// TODO: make timeout configurable
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-		ctx = context.WithValue(ctx, "activationType", "re-activate")
 
 		// Make a channel that collects all the results channels for all the
 		// concurrent calls we'll make to OM.
@@ -916,7 +933,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// 'rClient.InvokeMatchmakingFunctions()' calls below start
 			// returning matches.
 			for resChan := range fanInChan {
-				logger.Trace("received invocationResultChan on fanInChan")
+				lLogger.Trace("received invocationResultChan on fanInChan")
 
 				// Asynchronously read all matches from this channel.
 				go func() {
@@ -925,10 +942,10 @@ func (d *MockDirector) Run(ctx context.Context) {
 						// Process this returned match.
 						if resPb == nil {
 							// Something went wrong.
-							logger.Trace("StreamedMmfResponse protobuf was nil!")
+							lLogger.Trace("StreamedMmfResponse protobuf was nil!")
 						} else {
 							// We got a match result.
-							logger.Trace("Received match from MMF")
+							lLogger.Trace("Received match from MMF")
 
 							// NOTE: If you have some director match processing that can
 							// be done asynchronously, like reading match metadata from
@@ -962,12 +979,12 @@ func (d *MockDirector) Run(ctx context.Context) {
 			for _, mmf := range reqPb.GetMmfs() {
 				mmfLogFields[mmf.GetName()] = mmf.GetHost()
 			}
-			logger.WithFields(mmfLogFields).Debug("kicking off MMFs")
+			lLogger.WithFields(mmfLogFields).Debug("kicking off MMFs")
 
 			// Add this request to the list of pending requests, indexed by hash.
 			mmfReqHash, err := ex.String(reqPb.Profile.GetExtensions(), ex.MMFRequestHashKey)
 			if err != nil {
-				logger.Errorf("Unable to retreive MmfRequest hash from profile extensions, discarding MmfRequest: %v", err)
+				lLogger.Errorf("Unable to retreive MmfRequest hash from profile extensions, discarding MmfRequest: %v", err)
 				continue
 			}
 			d.pendingMmfRequestsByHash[mmfReqHash] = reqPb
@@ -999,24 +1016,26 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// - matches below a specific quality score,
 		// - matches that outstrip our game server capacity, etc.
 		numRejectedTickets := 0
-		logger.Debugf("%v proposed matches to evaluate", len(proposedMatches))
+		lLogger.Debugf("%v proposed matches to evaluate", len(proposedMatches))
 
-		// Simple local function to 'reject' a proposed match by adding all the
-		// tickets in it to the list of tickets to reactivate in OM.
+		// Here is where you loop over all the returned match proposals and make decisions.
+		//
+		// Here's a simple local function to 'reject' a proposed match by adding all the
+		// tickets in it to the channel of ticket ids to reactivate in OM.
 		rejectMatch := func(match *pb.Match) {
 			//rejectedMatchesCounter.Add(ctx, 1)
 			for _, roster := range match.GetRosters() {
 				for _, ticket := range roster.GetTickets() {
 					// queue this ticket ID to be re-activated
+					d.Log.Tracef("sending ticketid %v for re-activation", ticket.GetId())
 					ticketIdsToActivate <- ticket.GetId()
 					numRejectedTickets++
 				}
 			}
 		}
 
-		// Here is where you loop over all the returned match proposals and make decisions.
 		for _, match := range proposedMatches {
-			mLogger := logger.WithFields(logrus.Fields{
+			mLogger := lLogger.WithFields(logrus.Fields{
 				"match_id": match.Id,
 			})
 			// Common decision points:
@@ -1121,15 +1140,19 @@ func (d *MockDirector) Run(ctx context.Context) {
 
 		}
 
-		// Re-activate the rejected tickets so they appear in matchmaking pools again.
-		d.OmClient.ActivateTickets(ctx, ticketIdsToActivate)
+		// Calculate length of time to sleep before next loop.
+		// TODO: proper exp BO + jitter
+		// First, wait until ticket (re-)activations are complete
+		sleepDur := time.Until(startTime.Add(time.Millisecond * 1000)) // >= OM_CACHE_IN_WAIT_TIMEOUT_MS for efficiency's sake
+		dur := time.Now().Sub(startTime)
+		sleepDur = (time.Millisecond * 1000) - dur
 
 		// Status update closure. This is currently just for development
 		// debugging and may be removed or made into a separate function in
 		// future versions
 		{
 			// Print status for this cycle
-			logger.Trace("Acquiring lock to write cycleStatus")
+			lLogger.Trace("Acquiring lock to write cycleStatus")
 
 			numCycles := fmt.Sprintf("/%v", d.Cfg.GetInt("NUM_MM_CYCLES"))
 			if d.Cfg.GetInt("NUM_MM_CYCLES") > 600000 { // ~600k seconds is roughly a week
@@ -1139,20 +1162,15 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// Lock the mutex while updating the status for this cycle so
 			// it can't be read while we're writing it.
 			statusUpdateMutex.Lock()
-			cycleStatus = fmt.Sprintf("Cycle %06d%v: %4d/%4d matches accepted", d.Cfg.GetInt("NUM_MM_CYCLES")+1-i, numCycles, len(matches), len(proposedMatches))
+			cycleStatus = fmt.Sprintf("Cycle %06d%v: %4d/%4d matches accepted, next invocation in %v ms", d.Cfg.GetInt("NUM_MM_CYCLES")+1-i, numCycles, len(matches), len(proposedMatches), sleepDur.Milliseconds())
 			statusUpdateMutex.Unlock()
 
 			// Write the status of this cycle to the logger.
-			logger.Info(cycleStatus)
+			lLogger.Info(cycleStatus)
 		}
 
-		// Sleep before next loop.
-		// TODO: proper exp BO + jitter
-		sleepDur := time.Until(startTime.Add(time.Millisecond * 1000)) // >= OM_CACHE_IN_WAIT_TIMEOUT_MS for efficiency's sake
-		dur := time.Now().Sub(startTime)
-		sleepDur = (time.Millisecond * 1000) - dur
+		// Sleep the calculated time.
 		time.Sleep(sleepDur)
-		time.Sleep(3 * time.Second)
 
 		// Release resources associated with this context.
 		cancel()

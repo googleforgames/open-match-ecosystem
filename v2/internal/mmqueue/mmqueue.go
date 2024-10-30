@@ -70,11 +70,11 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	logger := q.Log.WithFields(logrus.Fields{
 		"app":       "matchmaker",
 		"component": "queue",
-		"operation": "ticket_creation_loop",
 	})
 
 	// Var init
-	ticketIdsToActivate := make(chan string)
+	var wg sync.WaitGroup
+	ticketIdsToActivate := make(chan string, 10000)
 
 	// Initialize metrics
 	if q.Cfg.GetBool("OTEL_SIDECAR") {
@@ -85,7 +85,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 	registerMetrics(meterptr)
 
-	// This inline function is a simple callback that otel uses to read
+	// This inline function is a simple callback that open telemetry uses to read
 	// the current TPS
 	meter := *meterptr
 	_, err := meter.RegisterCallback(
@@ -106,12 +106,19 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	// Control number of concurrent requests by creating ticket creation 'slots'
 	slots := make(chan struct{}, q.Cfg.GetInt("MAX_CONCURRENT_TICKET_CREATIONS"))
 
-	logger.Debug("Processing queued tickets")
-	// Read from the incoming ticket request channel, and create one ticket for
-	// each incoming request.  Limit the number of concurrent creations by
-	// blocking until one of the MAX_CONCURRENT_TICKET_CREATIONS 'slots' is
-	// available.
+	// Goroutine to read from the incoming ticket request channel, and create
+	// one ticket for each incoming request.  Limit the number of concurrent
+	// creations by blocking until one of the MAX_CONCURRENT_TICKET_CREATIONS
+	// 'slots' is available.
 	go func() {
+		cLogger := q.Log.WithFields(logrus.Fields{
+			"operation": "ticket_creation",
+		})
+		cLogger.Debug("Processing queued ticket creation requests")
+
+		// Don't exit the Run() function as long as this goroutine is running.
+		wg.Add(1)
+		defer wg.Done()
 
 		// Loop forever
 		for {
@@ -153,23 +160,39 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 
 	}()
 
-	// activate pending tickets.
-	go func() {
-		for {
-			ctx := context.WithValue(ctx, "activationType", "activate")
-			q.OmClient.ActivateTickets(ctx, ticketIdsToActivate)
-			otelActivationsPerCall.Record(ctx, int64(len(ticketIdsToActivate)))
-			// TODO: actually tune this sleep to use exp BO + jitter
-			time.Sleep(1 * time.Second)
-		}
-	}()
-
-	// process incoming assignments.
+	// goroutine to activate pending tickets.
 	go func() {
 		aLogger := q.Log.WithFields(logrus.Fields{
-			"component": "matchmaking_queue",
+			"operation": "ticket_activation",
+		})
+		aLogger.Debug("activating created tickets")
+
+		// Don't exit the Run() function as long as this goroutine is running.
+		wg.Add(1)
+		defer wg.Done()
+
+		// Make a derived context with the activationType 'activate', which is used
+		// by the omclient to distinguish between logs for initial ticket activation
+		// and re-activation after a failed matching attempt.
+		ctx := context.WithValue(ctx, "activationType", "activate")
+		//aLogger := q.Log.WithFields(logrus.Fields{
+		//	"component": "matchmaking_queue",
+		//	"operation": "ticket_activation",
+		//})
+
+		q.OmClient.ActivateTickets(ctx, ticketIdsToActivate)
+	}()
+
+	// goroutine to process incoming assignments.
+	go func() {
+		bLogger := q.Log.WithFields(logrus.Fields{
 			"operation": "ticket_assignment",
 		})
+		logger.Debug("processing incoming ticket assignments")
+
+		// Don't exit the Run() function as long as this goroutine is running.
+		wg.Add(1)
+		defer wg.Done()
 
 		var assignment string
 		for roster := range q.AssignmentsChan {
@@ -183,7 +206,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 				// TODO: in reality, this is where your matchmaking queue would
 				// return the assignment to the game client. This sample
 				// instead just logs the assignment.
-				aLogger.Debugf("Received ticket %v assignment: %v", ticket.GetId(), assignment)
+				bLogger.Debugf("Received ticket %v assignment: %v", ticket.GetId(), assignment)
 				// Stop tracking this ticket; it's matchmaking is complete.
 				// Your matchmaker may wish to instead keep this for a time (in
 				// case the game client needs to request the same assignment
@@ -195,32 +218,38 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 			otelTicketAssignments.Add(ctx, int64(index))
 		}
 	}()
+
+	// Don't exit the Run() function as long as any of the goroutines are
+	// running (in normal operation, this is forever).
+	wg.Wait()
 }
 
 // SetTPS instructs the test function GenerateTestTickets() to make `newTPS`
-// tickets per second using `ticketCreationFunc()`.
-func (q *MatchmakerQueue) SetTestTPS(newTPS int,
+// tickets per second using `ticketCreationFunc()`. Example mock client ticket
+// creations functions can be found in internal/mocks/gameclient
+func (q *MatchmakerQueue) SetTestTicketConfig(newTPS int64,
 	ticketCreationFunc func(context.Context) *pb.Ticket) {
 
 	// This can be updated at any time by the calling code, so protect it with a mutex
 	tpsMutex.Lock()
-	q.TPS = int64(newTPS)
+	q.TPS = newTPS
 	newTicket = ticketCreationFunc
 	tpsMutex.Unlock()
 }
 
-// Test the queue by generating tickets ever second.
+// Test the queue by generating tickets every second.
 // This is only suitable for automated testing; in a real matchmaker, the
 // server that instantiated the mmqueue will be inserting all the ClientRequest
-// objects as client matchmaking requests come in.
+// objects as client matchmaking requests come in.  You can find example mock client
+// ticket creation functions in internal/mocks/gameclient.
 // To use this function:
 //   - instante your mmqueue object (by convention, in a variable named 'q')
 //   - asynchronously run the queue: `go q.Run(ctx)`
+//   - to set up ticket generation, send a non-zero TPS & a ticket creation function to the SetTPS function:
+//     `q.SetTestTicketConfig(10, <ticket creation function>)`
 //   - asynchronously run the test ticket generator: `go q.GenerateTestTickets(ctx)`
-//   - to start generating tickets every second, send a non-zero TPS to the SetTPS function:
-//     `q.SetTestTPS(10)`
 //   - to stop generating tickets, send 0 to the SetTPS function:
-//     `q.SetTestTPS(0)`
+//     `q.SetTestTicketConfig(0, <ticket creation function>)`
 func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 	tpsLogger := q.Log.WithFields(logrus.Fields{"component": "generate_tickets"})
 

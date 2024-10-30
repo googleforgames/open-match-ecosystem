@@ -49,11 +49,15 @@ import (
 )
 
 var (
+	// global vars
 	statusUpdateMutex sync.RWMutex
 	cycleStatus       string
 	cfg               = viper.New()
 	tickets           sync.Map
-	mmfFifo           = &pb.MatchmakingFunctionSpec{
+
+	// configuration that requires recompilation
+	mockClientTicket = gameclient.Simple
+	mmfFifo          = &pb.MatchmakingFunctionSpec{
 		Name: "FIFO",
 		Type: pb.MatchmakingFunctionSpec_GRPC,
 	}
@@ -99,6 +103,7 @@ func main() {
 
 	// Ticket creation config
 	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 3)
+	cfg.SetDefault("INITIAL_TPS", 10)
 
 	// InvokeMatchmaking Function config
 	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)                               // Default is essentially forever
@@ -217,7 +222,7 @@ func main() {
 
 				// TODO: replace the gameclient.Simple() call with your own code to
 				// process the request 'r' into an Open Match *pb.Ticket.
-				return gameclient.Simple(ctx)
+				return mockClientTicket(ctx)
 			}(r),
 		}
 
@@ -227,8 +232,9 @@ func main() {
 
 	// FOR TESTING ONLY
 	// Asynchronous goroutine that loops forever, attempting to queue
-	// 'tixPerSec' number of tickets each second. Update the tps by sending an
+	// the given number of tickets each second. Update the tps by sending an
 	// http GET to /tps/<NUM> as per the handler below.
+	q.SetTestTicketConfig(cfg.GetInt64("INITIAL_TPS"), mockClientTicket)
 	go q.GenerateTestTickets(ctx)
 	// Handler to update the (best effort) number of test tickets we want to
 	// generate and put into the queue per second. If the requested TPS is more
@@ -236,8 +242,8 @@ func main() {
 	// can. Set it to 0 to stop automatically creating tickets.
 	http.HandleFunc("/tps/{tixPerSec}", func(w http.ResponseWriter, r *http.Request) {
 
-		// Attempt to convert requested TPS string into an integer
-		rTPS, err := strconv.Atoi(r.PathValue("tixPerSec"))
+		// Attempt to convert requested TPS string into an int64
+		rTPS, err := strconv.ParseInt(r.PathValue("tixPerSec"), 10, 64)
 		if err != nil {
 			// Couldn't convert to int; maybe a typo in the http request?
 			w.WriteHeader(http.StatusBadRequest)
@@ -250,7 +256,7 @@ func main() {
 		}
 
 		// Update tixPerSec number, and generate tickets using the gameclient.Simple function.
-		q.SetTestTPS(rTPS, gameclient.Simple)
+		q.SetTestTicketConfig(rTPS, mockClientTicket)
 
 		logger.Infof("TPS set to %v", rTPS)
 		w.WriteHeader(http.StatusOK)

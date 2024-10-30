@@ -144,125 +144,134 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 	return resPb.TicketId, err
 }
 
-// ActivateTickets takes a list of ticket ids for tickets awaiting activation,
+// ActivateTickets takes a channel of ticket ids for tickets awaiting activation,
 // and breaks them into batches of the size defined in
 // rc.cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL") (see
 // open-match.dev/core/internal/config for limits on how many actions you can
-// request in a single API call, this needs to use the same value)
+// request in a single API call, this needs to use the same value).
 func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToActivate chan string) {
-
 	logger := rc.Log.WithFields(logrus.Fields{
 		"component": "open_match_client",
 		"operation": "proxy_ActivateTickets",
+		"caller": func() string {
+			// Quick in-line function to grab information the calling function
+			// put into the context and propogate it to the logs
+			ts, ok := ctx.Value("activationType").(string)
+			if !ok {
+				rc.Log.Error("unable to get caller type from context")
+				return "undefined"
+			}
+			return ts
+		}(),
 	})
 
-	// Activate all new tickets
-	done := false
-	ticketsAwaitingActivation := make([]string, 0)
+	// batching asynchronous goroutine. Processes incoming ticket ids into a
+	// batch of max size OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL, or until the
+	// deadline is reached, whichever comes first, then starts a new batch as long
+	// as the incoming channel has not been closed.
+	batchChan := make(chan []string)
+	go func() {
+		bLogger := logger.WithFields(logrus.Fields{
+			"suboperation": "create_batches",
+		})
 
+		// As long as the channel is not closed, keep reading batches from it.
+		numBatches := 0
+		senderActive := true
+		var tid string
+		for senderActive {
+
+			// Wait no longer than deadline for a batch to be created and sent for processing
+			deadline := time.NewTimer(250 * time.Millisecond)
+			activationBatch := make([]string, 0)
+			batchComplete := false
+
+			// Loop through incoming ticket ids, until batch limit is reached or deadline is exceeded
+			for !batchComplete {
+
+				select {
+				case tid, senderActive = <-ticketIdsToActivate:
+					activationBatch = append(activationBatch, tid)
+					if len(activationBatch) == rc.Cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL") {
+						batchComplete = true
+					}
+				case <-deadline.C:
+					batchComplete = true
+				}
+			}
+
+			// Send the batch to be sent in a single call to om-core
+			numBatches++
+			if len(activationBatch) > 0 {
+				bLogger.Tracef("queueing batch of %v ticket ids to send for activation", len(activationBatch))
+				batchChan <- activationBatch
+			}
+
+		}
+
+		// All done with creating batches.
+		bLogger.Tracef("processed %v batches before the sender stopped sending ticket ids", numBatches)
+		close(batchChan)
+	}()
+
+	// Loop that sends all batches made by the above goroutine to om-core
 	var activationWg sync.WaitGroup
-	for len(ticketsAwaitingActivation) == rc.Cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL") || !done {
+	for batch := range batchChan {
 
-		// Collect tickets from the channel.
-		ticketsAwaitingActivation = nil
-		for !done {
-			select {
-			case tid := <-ticketIdsToActivate:
-				ticketsAwaitingActivation = append(ticketsAwaitingActivation, tid)
-				if len(ticketsAwaitingActivation) == rc.Cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL") {
-					// maximum updates allowed per api call, go ahead and activate these,
-					// then loop to grab what is left in the channel.
-					done = true
-				}
-			default:
-				done = true
-			}
-		}
+		// Kick off activation in a goroutine, so if there are multiple batches
+		// all calls are made concurrently.
+		go func(thisBatch []string) {
 
-		// We've got tickets to activate
-		if len(ticketsAwaitingActivation) > 0 {
-			logger.Debugf("ActivateTicket call with %v tickets: %v...", len(ticketsAwaitingActivation), ticketsAwaitingActivation[0])
-			if len(ticketsAwaitingActivation) == rc.Cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL") {
-				done = false
-			}
+			// Track this goroutine
+			activationWg.Add(1)
+			defer activationWg.Done()
 
-			// Kick off activation in a goroutine in case we had to split on
-			// rc.cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL"), this way the calls are made concurrently.
-			go func(ticketsAwaitingActivation []string) {
+			// Generate request protobuffer to send to activate tickets endpoint
+			reqPb := &pb.ActivateTicketsRequest{TicketIds: thisBatch}
+			var err error
 
-				// Quick in-line function to grab information
-				// the calling function put into the context when
-				// logging errors (to aid debugging)
-				callerFromContext := func() string {
-					ts, ok := ctx.Value("activationType").(string)
-					if !ok {
-						logger.Error("unable to get caller type from context")
-						return "undefined"
-					}
-					return ts
-				}
-
-				// Track this goroutine
-				activationWg.Add(1)
-				defer activationWg.Done()
-
-				// Activate tickets
-				reqPb := &pb.ActivateTicketsRequest{TicketIds: ticketsAwaitingActivation}
-				var err error
-
-				// Marshal request into json
-				req, err := protojson.Marshal(reqPb)
-				if err != nil {
-					logger.WithFields(logrus.Fields{
-						"caller":     callerFromContext,
-						"pb_message": "ActivateTicketsRequest",
-					}).Errorf("cannot marshal protobuf to json")
-				}
-
-				// HTTP version of the gRPC ActivateTickets() call that we want to retry with exponential backoff and jitter
-				activateTicketCall := func() error {
-					logger.Tracef("%v Tix awaiting activation", len(ticketsAwaitingActivation))
-					resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets:activate", req)
-					// TODO: In reality, the error has details fields, telling us which ticket couldn't
-					// be activated, but we're not processing those or passing them on yet, we just act as
-					// though it is all-or-nothing.
-					if err != nil {
-						logger.WithFields(logrus.Fields{
-							"caller": callerFromContext,
-						}).Errorf("ActivateTickets attempt failed: %v", err)
-
-						return err
-					} else if resp != nil && resp.StatusCode != http.StatusOK { // HTTP error code
-						logger.WithFields(logrus.Fields{
-							"caller": callerFromContext,
-						}).Errorf("ActivateTickets attempt failed: %v", fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode))
-						return fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
-					}
-					return nil
-				}
-
-				//err = activateTicketCall()
-				err = backoff.RetryNotify(
-					activateTicketCall,
-					backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)),
-					func(err error, bo time.Duration) {
-						// The function that gets called to notify us when there's an activateTicketCall failure, before it is retried.
-						logger.Errorf("ActivateTicket temporary failure (backoff for %v): %v", err, bo)
-					})
-				if err != nil {
-					logger.WithFields(logrus.Fields{
-						"caller": callerFromContext,
-					}).Errorf("ActivateTickets failed: %v", err)
-				}
+			// Marshal request into json
+			req, err := protojson.Marshal(reqPb)
+			if err != nil {
 				logger.WithFields(logrus.Fields{
-					"caller": callerFromContext,
-				}).Debug("ActivateTickets complete")
-			}(ticketsAwaitingActivation)
-		}
+					"pb_message": "ActivateTicketsRequest",
+				}).Errorf("cannot marshal protobuf to json")
+			}
+
+			// HTTP version of the gRPC ActivateTickets() call that we want to retry with exponential backoff and jitter
+			activateTicketCall := func() error {
+				logger.Tracef("ActivateTicket call with %v tickets: %v...", len(thisBatch), thisBatch[0])
+				resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets:activate", req)
+				// TODO: In reality, the error has details fields, telling us which ticket couldn't
+				// be activated, but we're not processing those or passing them on yet, we just act as
+				// though all activations succeeded or all activations failed.
+				if err != nil {
+					logger.Errorf("ActivateTickets attempt failed: %v", err)
+					return err
+				} else if resp != nil && resp.StatusCode != http.StatusOK { // HTTP error code
+					err = fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
+					logger.Errorf("ActivateTickets attempt failed: %v", err)
+					return err
+				}
+				return nil
+			}
+
+			// Try to call ActivateTickets() with retries for up to 5 seconds.
+			err = backoff.RetryNotify(
+				activateTicketCall,
+				backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)),
+				func(err error, bo time.Duration) {
+					logger.Errorf("ActivateTicket temporary failure (backoff for %v): %v", err, bo)
+				},
+			)
+			if err != nil {
+				logger.Errorf("ActivateTickets failed: %v", err)
+			}
+			logger.Trace("ActivateTickets complete")
+		}(batch)
 	}
 
-	// After gathering all the activations and making all the necessary
-	// calls, wait on the waitgroup to finish.
+	// wait for all outstanding asynchronous calls to om-core's ActivateTickets() endpoint to complete
 	activationWg.Wait()
 }
 
