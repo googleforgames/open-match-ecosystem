@@ -45,7 +45,8 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	// Initialize all declared Metrics
 	otelTicketsGeneratedPerSecond, err = meter.Int64ObservableGauge(
 		metricsNamePrefix+"tps.request",
-		otelmetrics.WithDescription("Number of test tickets being generated per second"),
+		otelmetrics.WithDescription("Number of test tickets generations attempted per second"),
+		otelmetrics.WithUnit("tickets/second"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -61,7 +62,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelTicketGenerationsAchievedPerSecond, err = meter.Int64Histogram(
 		metricsNamePrefix+"tps.actual",
-		otelmetrics.WithDescription("Total tickets set to active, so they appear in pools"),
+		otelmetrics.WithDescription("Actual number of tickets successfully created each second"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -69,7 +70,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelTicketCreations, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.creations",
-		otelmetrics.WithDescription("Total tickets created"),
+		otelmetrics.WithDescription("Total tickets created since startup"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -85,7 +86,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelTicketAssignments, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.assignments",
-		otelmetrics.WithDescription("Total tickets assignments received"),
+		otelmetrics.WithDescription("Total ticket assignments received"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)

@@ -32,7 +32,8 @@ var (
 	NoSuchKeyError = errors.New("Extension field contains no such key")
 )
 
-// Combine concatinates two map[string]*anypb.Any maps.
+// Combine concatinates two map[string]*anypb.Any maps. If the two maps contain
+// values at the same key, the value in map 'b' takes precedent.
 func Combine(a map[string]*anypb.Any, b map[string]*anypb.Any) map[string]*anypb.Any {
 	for k, v := range b {
 		a[k] = v
@@ -40,8 +41,8 @@ func Combine(a map[string]*anypb.Any, b map[string]*anypb.Any) map[string]*anypb
 	return a
 }
 
-// String a simple helper function to get an string out of the extensions field
-// and make it a standard golang string.
+// String() is a simple helper function to retrieve the string stored in the
+// extensions field at the provided key, and return it as a standard golang string value.
 func String(ex map[string]*anypb.Any, exKey string) (out string, err error) {
 	stringPb := &knownpb.StringValue{}
 	if exValue, ok := ex[exKey]; ok {
@@ -54,8 +55,8 @@ func String(ex map[string]*anypb.Any, exKey string) (out string, err error) {
 	return "", NoSuchKeyError
 }
 
-// Bool a simple helper function to get an boolean out of the extensions field
-// and make it a standard golang bool.
+// Bool() is a simple helper function to retrieve the bool stored in the
+// extensions field at the provided key, and return it as a standard golang bool value.
 func Bool(ex map[string]*anypb.Any, exKey string) (out bool, err error) {
 	boolPb := &knownpb.BoolValue{}
 	if exValue, ok := ex[exKey]; ok {
@@ -68,8 +69,8 @@ func Bool(ex map[string]*anypb.Any, exKey string) (out bool, err error) {
 	return false, NoSuchKeyError
 }
 
-// Int32 is a simple helper function to get an int32 out of the extensions field
-// and make it a standard golang int.
+// Int32() is a simple helper function to retrieve the int32 stored in the
+// extensions field at the provided key, and return it as a standard golang int value.
 func Int32(ex map[string]*anypb.Any, exKey string) (out int, err error) {
 	int32Pb := &knownpb.Int32Value{}
 	if exValue, ok := ex[exKey]; ok {
@@ -100,8 +101,9 @@ func MMFRequest(ex map[string]*anypb.Any, exKey string) (*pb.MmfRequest, error) 
 	return nil, NoSuchKeyError
 }
 
-// Make a map[string]int32 into a map of 'any' protobuf messages, suitable to
-// send in the extensions field of a Open Match protobuf message.
+// AnypbIntMap() takes a golang map[string]int32 and creates an identical map
+// of 'any' protobuf messages, suitable to send in the extensions field of a
+// Open Match protobuf message.
 func AnypbIntMap(in map[string]int32) map[string]*anypb.Any {
 	out := make(map[string]*anypb.Any)
 	for key, value := range in {

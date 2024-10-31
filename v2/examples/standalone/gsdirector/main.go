@@ -69,6 +69,9 @@ func main() {
 	cfg.SetDefault("LOGGING_LEVEL", "info")
 	cfg.SetDefault("LOG_CALLER", "false")
 
+	// Metrics config
+	cfg.SetDefault("OTEL_SIDECAR", "false")
+
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
 

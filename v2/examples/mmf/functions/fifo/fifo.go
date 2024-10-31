@@ -125,8 +125,9 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
 	t := time.Now().Format("2006-01-02T15:04:05.00")
 
-	// Retrieve custom parameters we put into the request profile. If they don't exist,
-	// we just fall back to the defaults declared in the source.
+	// Retrieve custom parameters we put into the request profile. If they
+	// don't exist, we just fall back to the defaults declared in the var
+	// section near the beginning of this file.
 	exDesiredNumRosters, err := extensions.Int32(req.GetExtensions(), "desiredNumRosters")
 	if err == nil {
 		desiredNumRosters = exDesiredNumRosters
@@ -143,12 +144,12 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	matchNum := 0
 
 	// Continue as long as there are enough tickets left to make the desired
-	// number of rosters the requested minmum length
+	// number of rosters of the requested minmum length
 	for len(tickets) > (minRosterLen * desiredNumRosters) {
 
 		match := &pb.Match{
 			// Make a unique Match ID.
-
+			//
 			// By convention, match names should use reverse-DNS notation
 			// https://en.wikipedia.org/wiki/Reverse_domain_name_notation This
 			// helps with metric attribute cardinality, as we can record
@@ -158,12 +159,13 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 			// dot.
 			// https://grafana.com/blog/2022/02/15/what-are-cardinality-spikes-and-why-do-they-matter/
 			Id: fmt.Sprintf("profile-%s.time-%s-num-%d", matchName, t, matchNum),
-			// Make 'desiredNumRosters' number of empty rosters.
+			// Initialize empty roster map.
 			Rosters: make(map[string]*pb.Roster),
-			// It is best practice to copy all extensions in the profile over to each outgoing match.
+			// It is best practice to copy all extensions in the profile over
+			// to each outgoing match.
 			Extensions: req.GetExtensions(),
 		}
-		// Examples of adding data to the match extensions field
+		// Examples of adding data to the outgoing match's extensions field
 		match.Extensions["mmfName"], err = anypb.New(&knownpb.StringValue{Value: matchName})
 		if err != nil {
 			s.logger.Errorf("Unable to create 'mmfName' extension for match %v", match.Id)
@@ -186,14 +188,14 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 			// rosters as evenly as possible.
 			indexedRosterNames = append(indexedRosterNames, rosterName)
 
-			// Example of adding data to the roster extension field.
+			// Example of adding data to the outgoing match rosters' extension field.
 			rosterExtensions := make(map[string]*anypb.Any)
 			rosterExtensions["CreationTime"], err = anypb.New(timestamppb.Now())
 			if err != nil {
 				s.logger.Errorf("Unable to create 'CreationTime' extension for match roster: %v", err)
 			}
 
-			// Add the empty player roster to the roster list.
+			// Add an empty player roster to the roster list.
 			match.Rosters[rosterName] = &pb.Roster{
 				Name:       rosterName,
 				Tickets:    make([]*pb.Ticket, 0, desiredRosterLen),
@@ -241,65 +243,68 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		if rosterLengthsLessThan(match, desiredRosterLen) {
 			score = 25 // see above comments about the score.
 
+			// ----------------------------------------------------------------
 			// If your matchmaker design includes having the matching logic
 			// determine what kind of tickets should be added to an existing
 			// session on subsequent matchmaking cycles (for example, a
 			// backfill, join-in-progress, or high-density game server case),
 			// here is where you would construct a profile with all the
-			// necessary matching parameters. Alternatively, if your matchmaker
-			// design prefers to determine what kinds of tickets to search for
-			// elsewhere - for example, in your game server management
-			// software, then you can remove or ignore this section.
+			// necessary matching parameters for subsequent requests coming
+			// from the game server that hosts this match. Alternatively, if
+			// your matchmaker design prefers to determine what kinds of
+			// tickets to search for elsewhere - for example, in your game
+			// server management software, then you can remove or ignore this
+			// section.
+			// ----------------------------------------------------------------
 
-			// TODO: finish this backfill WIP and test it
+			// Generate an updated profile to get more tickets for this match.
+			updatedPools := map[string]*pb.Pool{}
+			// Copy over the pool filters and extensions used to run this MMF.
+			for pname, pool := range req.GetPools() {
+				updatedPools[pname] = &pb.Pool{
+					Name:                    pool.GetName(),
+					TagPresentFilters:       pool.GetTagPresentFilters(),
+					StringEqualsFilters:     pool.GetStringEqualsFilters(),
+					DoubleRangeFilters:      pool.GetDoubleRangeFilters(),
+					CreationTimeRangeFilter: pool.GetCreationTimeRangeFilter(),
+					Extensions:              pool.GetExtensions(),
+				}
+			}
+			updatedProfile := &pb.Profile{
+				// Name this as a backfill profile so we can see it clearly in logs/metrics.
+				Name:       "backfill." + match.GetId(),
+				Pools:      updatedPools,
+				Extensions: req.GetExtensions(),
+			}
 			// Next time this profile is used for matching, we will only
 			// request as many tickets as we have empty slots in the rosters.
-			//			remainingRostersCapacity := desiredRosterLen - lowestRosterLen(match)
-			//			s.logger.Infof("Returning match with %v/%v players in a roster; attaching a backfill MMF request", lowestRosterLen(match), desiredRosterLen)
-			//			s.logger.Tracef("Retrieving MMF list to invoke when requesting backfill from extension %v", extensions.MMFRequestKey)
-			//
-			//			// Generate an updated profile to get more tickets for this match.
-			//			updatedPools := map[string]*pb.Pool{}
-			//			// Copy over the pool filters and extensions used to run this MMF.
-			//			for pname, pool := range req.GetPools() {
-			//				updatedPools[pname] = &pb.Pool{
-			//					Name:                    pool.GetName(),
-			//					TagPresentFilters:       pool.GetTagPresentFilters(),
-			//					StringEqualsFilters:     pool.GetStringEqualsFilters(),
-			//					DoubleRangeFilters:      pool.GetDoubleRangeFilters(),
-			//					CreationTimeRangeFilter: pool.GetCreationTimeRangeFilter(),
-			//					Extensions:              pool.GetExtensions(),
-			//				}
-			//			}
-			//			updatedProfile := &pb.Profile{
-			//				Name:       "backfill." + match.GetId(),
-			//				Pools:      updatedPools,
-			//				Extensions: req.GetExtensions(),
-			//			}
-			//			updatedProfile.Extensions["desiredRosterLen"], err = anypb.New(&knownpb.Int32Value{Value: int32(remainingRostersCapacity)})
-			//			if err != nil {
-			//				s.logger.Errorf("Unable to update the desiredRosterLen to reflect ticket capacity of match %v",
-			//					match.Id)
-			//			}
-			//
-			//			// A pb.MmfRequest with a list of MMFs to use for backfills and an empty profile were
-			//			// attached as a request extension by our matchmaker, retrieve it.
-			//			bfRequest, err := extensions.MMFRequest(req.GetExtensions(), extensions.MMFRequestKey)
-			//			if err != nil {
-			//				s.logger.Errorf("Unable to retrieve backfill details from extension %v, returning match without backfill request: err", extensions.MMFRequestKey)
-			//				continue
-			//			}
-			//
-			//			// Attach the updated profile with new matching criteria to our backfill request.
-			//			bfRequest.Profile = updatedProfile
-			//
-			//			// Add the new backfill matchmaking request to the match extensions
-			//			// field, so it is returned to our matchmaker.
-			//			match.Extensions[extensions.MMFRequestKey], err = anypb.New(bfRequest)
-			//			if err != nil {
-			//				s.logger.Errorf("Unable to create backfill matching profile as an extension for match %v",
-			//					match.Id)
-			//			}
+			remainingRostersCapacity := desiredRosterLen - lowestRosterLen(match)
+			updatedProfile.Extensions["desiredRosterLen"], err = anypb.New(&knownpb.Int32Value{Value: int32(remainingRostersCapacity)})
+			if err != nil {
+				s.logger.Errorf("Unable to update the desiredRosterLen to reflect ticket capacity of match %v",
+					match.Id)
+			}
+
+			// A pb.MmfRequest with a list of MMFs to use for backfills and an empty profile were
+			// attached as a request extension by our matchmaker, retrieve it.
+			s.logger.Tracef("Retrieving MMF list to invoke when requesting backfill from extension %v", extensions.MMFRequestKey)
+			bfRequest, err := extensions.MMFRequest(req.GetExtensions(), extensions.MMFRequestKey)
+			if err != nil {
+				s.logger.Errorf("Unable to retrieve backfill details from extension %v, returning match without backfill request: err", extensions.MMFRequestKey)
+				continue
+			}
+
+			// Attach the updated profile with new matching criteria to our new backfill matchmaking request.
+			bfRequest.Profile = updatedProfile
+
+			// Add the new backfill matchmaking request to the match extensions
+			// field, so it is returned to our matchmaker.
+			match.Extensions[extensions.MMFRequestKey], err = anypb.New(bfRequest)
+			if err != nil {
+				s.logger.Errorf("Unable to create backfill matching profile as an extension for match %v",
+					match.Id)
+			}
+			s.logger.Tracef("Returning match with %v/%v players in a roster; attaching a backfill MMF request: %v", lowestRosterLen(match), desiredRosterLen, bfRequest)
 		}
 
 		// Add match quality 'score' extension data to the match. See above
@@ -321,7 +326,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		// Keep track of the number of matches sent
 		matchNum++
 	}
-	s.logger.Infof("Total of %v matches returned", matchNum)
+	s.logger.Infof("Returning %v matches", matchNum)
 
 	return nil
 }
