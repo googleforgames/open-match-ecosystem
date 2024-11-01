@@ -30,6 +30,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
+	"go.opentelemetry.io/otel/metric"
 
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
@@ -38,6 +39,7 @@ import (
 
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
+	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
@@ -46,9 +48,17 @@ var (
 	cycleStatus       string
 	cfg               = viper.New()
 	tickets           sync.Map
+	meterptr          *metric.Meter
+	otelShutdownFunc  func(context.Context) error
 )
 
 func main() {
+
+	// Quit this process on the signals sent by kubernetes/knative/Cloud Run/ctrl+c.
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
@@ -70,7 +80,8 @@ func main() {
 	cfg.SetDefault("LOG_CALLER", "false")
 
 	// Metrics config
-	cfg.SetDefault("OTEL_SIDECAR", "false")
+	cfg.SetDefault("OTEL_SIDECAR", "true")
+	cfg.SetDefault("OTEL_PROM_PORT", 2225)
 
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
@@ -81,8 +92,13 @@ func main() {
 	logger := log.WithFields(logrus.Fields{"component": "game_server_director"})
 	logger.Debugf("%v cycles", cfg.GetInt("NUM_MM_CYCLES"))
 
-	// Connect to om-core server
-	ctx := context.Background()
+	// Initialize Metrics
+	if cfg.GetBool("OTEL_SIDECAR") {
+		meterptr, otelShutdownFunc = metrics.InitializeOtel()
+	} else {
+		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(2225)
+	}
+	defer otelShutdownFunc(ctx) //nolint:errcheck
 
 	// Initialize the director
 	d := &gsdirector.MockDirector{
@@ -94,8 +110,9 @@ func main() {
 		GSManager: &gsdirector.MockAgonesIntegration{
 			Log: log,
 		},
-		Cfg: cfg,
-		Log: log,
+		Cfg:          cfg,
+		Log:          log,
+		OtelMeterPtr: meterptr,
 	}
 	err := d.GSManager.Init(gsdirector.FleetConfig)
 	if err != nil {
@@ -115,10 +132,6 @@ func main() {
 	// Start the director. This is where profiles get sent to the InvokeMMFs()
 	// call, and matches returned.
 	go d.Run(ctx)
-
-	// Quit this process on the signals sent by kubernetes/knative/Cloud Run.
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
 
 	// Basic default handler that just returns the current matchmaking progress status as a string.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

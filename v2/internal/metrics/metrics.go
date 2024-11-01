@@ -90,8 +90,8 @@ func InitializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
 
 // InitializeOtelWithLocalProm runs  a default OpenTelemetry Reader and
 // implements prometheus.Collector, allowing it to be used as both a Reader and
-// Collector. http://localhost:2223/metrics . For use with local development.
-func InitializeOtelWithLocalProm() (*otelmetrics.Meter, func(context.Context) error) { //nolint:unused
+// Collector. http://localhost:<port>/metrics . For use with local development.
+func InitializeOtelWithLocalProm(port int) (*otelmetrics.Meter, func(context.Context) error) { //nolint:unused
 	// Get resource attributes
 	res, err := resource.New(
 		context.Background(),
@@ -124,9 +124,9 @@ func InitializeOtelWithLocalProm() (*otelmetrics.Meter, func(context.Context) er
 
 	// Start the prometheus HTTP server and pass the exporter Collector to it
 	go func() {
-		otelLogger.Infof("serving metrics at localhost:2223/metrics")
+		otelLogger.Infof("serving metrics at localhost:%v/metrics", port)
 		http.Handle("/metrics", promhttp.Handler())
-		err := http.ListenAndServe(":2223", nil) //nolint:gosec // Ignoring G114: Use of net/http serve function that has no support for setting timeouts.
+		err := http.ListenAndServe(fmt.Sprintf(":%v", port), nil) //nolint:gosec // Ignoring G114: Use of net/http serve function that has no support for setting timeouts.
 		if err != nil {
 			fmt.Printf("error serving http: %v", err)
 			return

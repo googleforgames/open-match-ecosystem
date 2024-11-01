@@ -24,6 +24,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"github.com/zeebo/xxh3"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -46,16 +48,12 @@ import (
 
 	"open-match.dev/open-match-ecosystem/v2/internal/extensions"
 	ex "open-match.dev/open-match-ecosystem/v2/internal/extensions"
-	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
 var (
 	logger            = &logrus.Logger{}
-	meterptr          *metric.Meter
-	otelShutdownFunc  func(context.Context) error
 	statusUpdateMutex sync.RWMutex
-	cycleStatus       string
 	tickets           sync.Map
 
 	// pool with a set of filters to find all players. Really only
@@ -209,9 +207,17 @@ type GameMode struct {
 // module you would write for a real matchmaker. It mocks out quite a bit of
 // functionality that would, in a real system, require you to read data from
 // kubernetes or Agones. This is only provided for testing.
+//
+// Generally you would right your game server integration module as a standalone
+// package you would import in your game server director. However for the time
+// being we've only written this one sample. Expect this to be broken into it's own
+// package if/when we ever have another game server integration implementation.
 type MockAgonesIntegration struct {
 	// Shared logger.
 	Log *logrus.Logger
+
+	// Open Telemetric metrics meter
+	OtelMeterPtr *metric.Meter // TODO: add metrics to the MockAgonesIntegration
 
 	// read-write mutex to control concurrent map access.
 	mutex sync.RWMutex
@@ -759,14 +765,6 @@ func (m *MockAgonesIntegration) Allocate(allocationSpecJSON string, match *pb.Ma
 	return connString
 }
 
-// hashcount is a simple struct used to sort the agones allocation specs
-// currently in memory by the number of servers that would be returned by each
-// spec.
-type ascount struct {
-	spec  string
-	count int
-}
-
 // GetMMFParams() returns all pb.MmfRequest messages currently tracked by the
 // Agones integration. These contain all the mmf parameters for matchmaking
 // function invocations that should be kicked off in the next director
@@ -778,11 +776,19 @@ func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
 		"operation": "get_mmf_params",
 	})
 
+	// var init
 	requests := make([]*pb.MmfRequest, 0)
 
-	// Sort the allocation specs by the number of servers they match (e.g.
-	// their reference count)
-	var asByCount []ascount // 'as' = allocation spec
+	// Sort the allocation specs by the number of servers they match.
+	//
+	// ascount is a simple struct we temporarily use to do the sorting.
+	//
+	// 'as' here is an abbreviation for 'allocation spec'
+	type ascount struct {
+		spec  string
+		count int
+	}
+	var asByCount []ascount
 
 	m.mutex.RLock()
 	for k, v := range m.gameServers {
@@ -894,6 +900,7 @@ type MockDirector struct {
 	Log                      *logrus.Logger
 	AssignmentsChan          chan *pb.Roster
 	GSManager                GameServerManager
+	OtelMeterPtr             *metric.Meter
 	pendingMmfRequestsByHash map[string]*pb.MmfRequest
 }
 
@@ -915,9 +922,6 @@ type MockDirector struct {
 // (They are provided for legacy reasons.)
 func (d *MockDirector) Run(ctx context.Context) {
 
-	// Var init
-	d.pendingMmfRequestsByHash = make(map[string]*pb.MmfRequest)
-
 	// Add fields to structured logging for this function
 	logger := d.Log.WithFields(logrus.Fields{
 		"app":       "matchmaker",
@@ -925,21 +929,18 @@ func (d *MockDirector) Run(ctx context.Context) {
 	})
 	logger.Tracef("Initializing game server director directing matches to game servers")
 
-	// local var init
+	// var init
+	d.pendingMmfRequestsByHash = make(map[string]*pb.MmfRequest)
 	ticketIdsToActivate := make(chan string, 10000)
 	var startTime time.Time
 	var proposedMatches []*pb.Match
 	var matches map[*pb.Match]string
 
 	// Initialize metrics
-
-	if d.Cfg.GetBool("OTEL_SIDECAR") {
-		meterptr, otelShutdownFunc = metrics.InitializeOtel()
-	} else {
-		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm()
+	if d.OtelMeterPtr != nil {
+		logger.Tracef("Initializing otel metris")
+		registerMetrics(d.OtelMeterPtr)
 	}
-	defer otelShutdownFunc(ctx) //nolint:errcheck
-	registerMetrics(meterptr)
 
 	// goroutine that runs for the lifetime of the game server director to
 	// re-activate rejected tickets so they appear in matchmaking pools again.
@@ -960,12 +961,16 @@ func (d *MockDirector) Run(ctx context.Context) {
 	lLogger.Debugf("Beginning matchmaking cycle, %v cycles configured", d.Cfg.GetInt("NUM_MM_CYCLES"))
 	for i := d.Cfg.GetInt("NUM_MM_CYCLES"); i > 0; i-- { // Main Matchmaking Loop
 
-		otelMatchmakingCycles.Add(ctx, 1)
-
 		// Loop var init
 		startTime = time.Now()
 		proposedMatches = []*pb.Match{}
 		matches = map[*pb.Match]string{}
+
+		// Metrics tracking
+		newMMFRequestsProcessed := int64(0)
+		numTicketAssignments := int64(0)
+		numRejectedMatches := int64(0)
+		numIdsToActivate := int64(0)
 
 		// Make a fresh context for this loop.
 		//
@@ -988,19 +993,18 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// TODO: make timeout configurable
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 
-		// Make a channel that collects all the results channels for all the
+		// Make a channel-of-channels that contains the response channels for all the
 		// concurrent calls we'll make to OM.
 		fanInChan := make(chan chan *pb.StreamedMmfResponse)
 
 		// Launch asynchronous match result processing function.
 		//
-		// We make a separate results channel for every InvokeMMF call
-		// - see the 'rClient.InvokeMatchmakingFunctions()' call below.
-		// Each of those results channels is sent to this match result
-		// processing goroutine on the 'fanInChan' channel. This allows all
-		// results from all MMFs in one cycle to be processed in one code path.
-		//
-		// This is a complex goroutine so it's over-commented.
+		// We make a separate reponse channel for every InvokeMMF call - see
+		// the 'rClient.InvokeMatchmakingFunctions()' call below.  Each of
+		// those channels is sent to this match result processing goroutine on
+		// the 'fanInChan' channel (it is a channel-of-channels). This allows
+		// all results from all MMFs in one cycle to be processed in one code
+		// path at the expense of complexity.
 		wg := sync.WaitGroup{}
 		go func() {
 
@@ -1011,7 +1015,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// 'rClient.InvokeMatchmakingFunctions()' calls below start
 			// returning matches.
 			for resChan := range fanInChan {
-				lLogger.Trace("received invocationResultChan on fanInChan")
+				lLogger.Trace("received mmf invocation response channel on fanInChan")
 
 				// Asynchronously read all matches from this channel.
 				go func() {
@@ -1021,6 +1025,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 						if resPb == nil {
 							// Something went wrong.
 							lLogger.Trace("StreamedMmfResponse protobuf was nil!")
+							otelMMFResponseFailures.Add(ctx, 1)
 						} else {
 							// We got a match result.
 							lLogger.Trace("Received match from MMF")
@@ -1048,28 +1053,46 @@ func (d *MockDirector) Run(ctx context.Context) {
 		requests := d.GSManager.GetMMFParams()
 		for _, reqPb := range requests {
 			wg.Add(1)
+			mmfLogFields := logrus.Fields{"operation": "mmfrequest"}
 
-			mmfLogFields := logrus.Fields{
-				"num_mmfs":     len(reqPb.GetMmfs()),
-				"profile_name": reqPb.GetProfile().GetName(),
-				"num_pools":    len(reqPb.GetProfile().GetPools()),
-			}
-			for _, mmf := range reqPb.GetMmfs() {
-				mmfLogFields[mmf.GetName()] = mmf.GetHost()
-			}
-			lLogger.WithFields(mmfLogFields).Debug("kicking off MMFs")
+			// Get the number of mmfs to be invoked by this request.
+			numMMFs := len(reqPb.GetMmfs())
 
-			// Get this request to the list of pending requests, indexed by hash.
+			// By convention, profile names should use reverse-DNS notation
+			// https://en.wikipedia.org/wiki/Reverse_domain_name_notation This
+			// helps with metric attribute/log field cardinality, as we can record
+			// profile names alongside metric readings after stripping off the
+			// most-unique portion.
+			profileName := reqPb.GetProfile().GetName()
+			i := strings.LastIndex(profileName, ".")
+			if i > 0 {
+				profileName = profileName[0:i]
+			}
+
+			// Add additional fields to this logger to help with debugging if it is enabled.
+			if logrus.IsLevelEnabled(logrus.DebugLevel) {
+				mmfLogFields["num_mmfs"] = numMMFs
+				mmfLogFields["profile_name"] = profileName
+				mmfLogFields["num_pools"] = len(reqPb.GetProfile().GetPools())
+				for _, mmf := range reqPb.GetMmfs() {
+					mmfLogFields[mmf.GetName()] = mmf.GetHost()
+				}
+			}
+			rLogger := lLogger.WithFields(mmfLogFields)
+			rLogger.Debug("kicking off MMFs")
+
+			// Save this request to the list of pending requests, indexed by hash.
 			//
-			// Retrieve pre-calculated hash from the request extensions.
+			// Retrieve pre-calculated hash from the request extensions instead
+			// of re-calculating it here.
 			mmfReqHash, err := ex.String(reqPb.Profile.GetExtensions(), ex.MMFRequestHashKey)
 			if err != nil {
-				lLogger.Errorf("Unable to retreive MmfRequest hash from profile extensions, discarding MmfRequest: %v", err)
+				rLogger.Errorf("Unable to retreive MmfRequest hash from profile extensions, discarding MmfRequest: %v", err)
 				continue
 			}
 			d.pendingMmfRequestsByHash[mmfReqHash] = reqPb
 
-			// Make a channel for responses from this individual MMF invocation.
+			// Make a channel for responses from this MMF invocation.
 			invocationResultChan := make(chan *pb.StreamedMmfResponse)
 
 			// Tell the fan-in goroutine to monitor this new channel for matches.
@@ -1078,6 +1101,11 @@ func (d *MockDirector) Run(ctx context.Context) {
 			// Invoke matchmaking functions, match results are sent back
 			// using the channel we just created.
 			go d.OmClient.InvokeMatchmakingFunctions(ctx, reqPb, invocationResultChan)
+
+			// Track metrics.
+			otelMMFsPerOMCall.Record(ctx, int64(numMMFs),
+				metric.WithAttributes(attribute.String("profile.name", profileName)),
+			)
 
 		}
 
@@ -1099,7 +1127,6 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// - player collisions among matches,
 		// - matches below a specific quality score,
 		// - matches that outstrip our game server capacity, etc.
-		numRejectedMatches := int64(0)
 		lLogger.Debugf("%v proposed matches to evaluate", len(proposedMatches))
 
 		// Here is where you loop over all the returned match proposals and make decisions.
@@ -1115,10 +1142,9 @@ func (d *MockDirector) Run(ctx context.Context) {
 					ticketIdsToActivate <- ticket.GetId()
 					otelTicketsRejected.Add(ctx, 1)
 				}
+				numIdsToActivate += int64(len(roster.GetTickets()))
 			}
 		}
-
-		otelMatchesProposedPerCycle.Record(ctx, int64(len(proposedMatches)))
 
 		for _, match := range proposedMatches {
 			mLogger := lLogger.WithFields(logrus.Fields{
@@ -1197,6 +1223,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			if err == nil && nextMMFRequest.GetProfile().GetName() != "" {
 				mLogger.Trace("Approved a match with a backfill request attached, sending backfill request to game server manager")
 				allocatorSpec = d.GSManager.UpdateMMFRequest(allocatorSpec, nextMMFRequest)
+				newMMFRequestsProcessed++
 			}
 
 			// This proposed match passed all our decision points and validation checks,
@@ -1204,7 +1231,6 @@ func (d *MockDirector) Run(ctx context.Context) {
 			//acceptedMatchesCounter.Add(ctx, 1)
 			matches[match] = allocatorSpec
 		}
-		otelMatchesRejectedPerCycle.Record(ctx, numRejectedMatches)
 
 		for match, allocatorSpec := range matches {
 			// TODO: Here is where you allocate the servers for your approved
@@ -1222,7 +1248,9 @@ func (d *MockDirector) Run(ctx context.Context) {
 				// Stream out the assignments to the mmqueue
 				for _, roster := range match.GetRosters() {
 					d.AssignmentsChan <- roster
+					numTicketAssignments++
 				}
+
 			} else {
 				// No valid connection string returned from the game server
 				// manager, there must be an issue. Put these tickets back into the
@@ -1237,28 +1265,27 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// First, wait until ticket (re-)activations are complete
 		sleepDur := time.Until(startTime.Add(time.Millisecond * 1000)) // >= OM_CACHE_IN_WAIT_TIMEOUT_MS for efficiency's sake
 		dur := time.Now().Sub(startTime)
-		otelMatchmakingCycleDuration.Record(ctx, float64(dur.Microseconds()/1000))
 		sleepDur = (time.Millisecond * 1000) - dur
+
+		// Record metrics for this cycle
+		otelMatchesRejectedPerCycle.Record(ctx, numRejectedMatches)
+		otelTicketActivationsPerCycle.Record(ctx, numIdsToActivate)
+		otelNewMMFRequestsProcessedPerCycle.Record(ctx, newMMFRequestsProcessed)
+		otelTicketAssignmentsPerCycle.Record(ctx, numTicketAssignments)
+		otelMatchesProposedPerCycle.Record(ctx, int64(len(proposedMatches)))
+		otelMatchmakingCycleDuration.Record(ctx, float64(dur.Microseconds()/1000))
 
 		// Status update closure. This is currently just for development
 		// debugging and may be removed or made into a separate function in
 		// future versions
 		{
-			// Print status for this cycle
-			lLogger.Trace("Acquiring lock to write cycleStatus")
-
 			numCycles := fmt.Sprintf("/%v", d.Cfg.GetInt("NUM_MM_CYCLES"))
 			if d.Cfg.GetInt("NUM_MM_CYCLES") > 600000 { // ~600k seconds is roughly a week
 				numCycles = "/--" // Number is so big as to be meaningless, just don't display it
 			}
 
-			// Lock the mutex while updating the status for this cycle so
-			// it can't be read while we're writing it.
-			statusUpdateMutex.Lock()
-			cycleStatus = fmt.Sprintf("Cycle %06d%v: %4d/%4d matches accepted, next invocation in %v ms", d.Cfg.GetInt("NUM_MM_CYCLES")+1-i, numCycles, len(matches), len(proposedMatches), sleepDur.Milliseconds())
-			statusUpdateMutex.Unlock()
-
 			// Write the status of this cycle to the logger.
+			cycleStatus := fmt.Sprintf("Cycle %06d%v: %4d/%4d matches accepted, next invocation in %v ms", d.Cfg.GetInt("NUM_MM_CYCLES")+1-i, numCycles, len(matches), len(proposedMatches), sleepDur.Milliseconds())
 			lLogger.Info(cycleStatus)
 		}
 

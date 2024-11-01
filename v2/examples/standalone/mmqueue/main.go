@@ -71,6 +71,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
+	"go.opentelemetry.io/otel/metric"
 
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
@@ -81,9 +82,15 @@ import (
 	//mmf "open-match.dev/mmf/server"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
+	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
 	"open-match.dev/open-match-ecosystem/v2/internal/mmqueue"
 	"open-match.dev/open-match-ecosystem/v2/internal/mocks/gameclient"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
+)
+
+var (
+	otelShutdownFunc func(context.Context) error
+	meterptr         *metric.Meter
 )
 
 func main() {
@@ -108,12 +115,24 @@ func main() {
 	cfg.SetDefault("LOGGING_LEVEL", "info")
 	cfg.SetDefault("LOG_CALLER", "false")
 
+	// Open Telemetry metrics config
+	cfg.SetDefault("OTEL_SIDECAR", "true")
+	cfg.SetDefault("OTEL_PROM_PORT", 2224)
+
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
 
 	// initialize shared structured logging
 	log := logging.NewSharedLogger(cfg)
 	logger := log.WithFields(logrus.Fields{"component": "matchmaking_queue"})
+
+	// Initialize Metrics
+	if cfg.GetBool("OTEL_SIDECAR") {
+		meterptr, otelShutdownFunc = metrics.InitializeOtel()
+	} else {
+		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(2225)
+	}
+	defer otelShutdownFunc(ctx) //nolint:errcheck
 
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
@@ -126,6 +145,7 @@ func main() {
 		Log:               log,
 		ClientRequestChan: make(chan *mmqueue.ClientRequest),
 		AssignmentsChan:   make(chan *pb.Roster),
+		OtelMeterPtr:      meterptr,
 	}
 
 	//Check connection before spinning everything up.

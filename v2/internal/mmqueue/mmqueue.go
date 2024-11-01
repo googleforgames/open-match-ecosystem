@@ -35,15 +35,12 @@ import (
 	//soloduelServer "open-match.dev/functions/golang/soloduel"
 	//mmf "open-match.dev/mmf/server"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
-	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
 var (
-	meterptr         *metric.Meter
-	otelShutdownFunc func(context.Context) error
-	tpsMutex         sync.Mutex
-	newTicket        func(context.Context) *pb.Ticket
+	tpsMutex  sync.Mutex
+	newTicket func(context.Context) *pb.Ticket
 )
 
 // Mock of the game platform services frontend that handles player matchmaking
@@ -56,6 +53,7 @@ type MatchmakerQueue struct {
 	Tickets           sync.Map
 	ClientRequestChan chan *ClientRequest
 	AssignmentsChan   chan *pb.Roster
+	OtelMeterPtr      *metric.Meter
 	TPS               int64
 }
 
@@ -77,17 +75,13 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	ticketIdsToActivate := make(chan string, 10000)
 
 	// Initialize metrics
-	if q.Cfg.GetBool("OTEL_SIDECAR") {
-		meterptr, otelShutdownFunc = metrics.InitializeOtel()
-	} else {
-		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm()
+	if q.OtelMeterPtr != nil {
+		logger.Tracef("Initializing otel metris")
+		registerMetrics(q.OtelMeterPtr)
 	}
-	defer otelShutdownFunc(ctx) //nolint:errcheck
-	registerMetrics(meterptr)
-
 	// This inline function is a simple callback that open telemetry uses to read
 	// the current TPS
-	meter := *meterptr
+	meter := *q.OtelMeterPtr
 	_, err := meter.RegisterCallback(
 		func(ctx context.Context, o metric.Observer) error {
 			// TPS can be updated asynchronously, so we protect reading it with a lock.
@@ -101,7 +95,6 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	if err != nil {
 		logger.Fatalf("Failed to set up tps gauge: %v", err)
 	}
-	logger.Infof("mmqueue metrics initialized")
 
 	// Control number of concurrent requests by creating ticket creation 'slots'
 	slots := make(chan struct{}, q.Cfg.GetInt("MAX_CONCURRENT_TICKET_CREATIONS"))

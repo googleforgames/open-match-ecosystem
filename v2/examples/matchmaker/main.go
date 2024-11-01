@@ -30,6 +30,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
+	"go.opentelemetry.io/otel/metric"
 
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
@@ -43,6 +44,7 @@ import (
 	"open-match.dev/open-match-ecosystem/v2/internal/extensions"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
+	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
 	"open-match.dev/open-match-ecosystem/v2/internal/mmqueue"
 	"open-match.dev/open-match-ecosystem/v2/internal/mocks/gameclient"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
@@ -54,6 +56,8 @@ var (
 	cycleStatus       string
 	cfg               = viper.New()
 	tickets           sync.Map
+	otelShutdownFunc  func(context.Context) error
+	meterptr          *metric.Meter
 
 	// configuration that requires recompilation
 	mockClientTicket = gameclient.Simple
@@ -121,7 +125,8 @@ func main() {
 	cfg.SetDefault("LOG_CALLER", "false")
 
 	// OpenTelemetry metrics config
-	cfg.SetDefault("OTEL_SIDECAR", "false")
+	cfg.SetDefault("OTEL_SIDECAR", "true")
+	cfg.SetDefault("OTEL_PROM_PORT", "2227")
 
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
@@ -132,6 +137,15 @@ func main() {
 	logger := log.WithFields(logrus.Fields{"application": "matchmaker"})
 	logger.Debugf("%v cycles", cfg.GetInt("NUM_MM_CYCLES"))
 
+	// Initialize Metrics
+	if cfg.GetBool("OTEL_SIDECAR") {
+		meterptr, otelShutdownFunc = metrics.InitializeOtel()
+	} else {
+		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(2225)
+	}
+	defer otelShutdownFunc(ctx) //nolint:errcheck
+
+	// Create assignments channel used to funnel assignments from the director to the game clients.
 	assignmentsChan := make(chan *pb.Roster)
 
 	// Initialize the queue
@@ -145,6 +159,7 @@ func main() {
 		Log:               log,
 		ClientRequestChan: make(chan *mmqueue.ClientRequest),
 		AssignmentsChan:   assignmentsChan,
+		OtelMeterPtr:      meterptr,
 	}
 
 	// Initialize the director
@@ -155,16 +170,20 @@ func main() {
 			Cfg:    cfg,
 		},
 		GSManager: &gsdirector.MockAgonesIntegration{
-			Log: log,
+			Log:          log,
+			OtelMeterPtr: meterptr,
 		},
 		Cfg:             cfg,
 		Log:             log,
 		AssignmentsChan: assignmentsChan,
+		OtelMeterPtr:    meterptr,
 	}
 
-	// Initialize the game server manager used by the director
+	// Configure the mmf server
 	mmfFifo.Host = cfg.GetString("SOLODUEL_ADDR")
 	mmfFifo.Port = cfg.GetInt32("SOLODUEL_PORT")
+
+	// Initialize the game server manager used by the director
 	err := d.GSManager.Init(fleetConfig)
 	if err != nil {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
@@ -239,6 +258,7 @@ func main() {
 	// http GET to /tps/<NUM> as per the handler below.
 	q.SetTestTicketConfig(cfg.GetInt64("INITIAL_TPS"), mockClientTicket)
 	go q.GenerateTestTickets(ctx)
+
 	// Handler to update the (best effort) number of test tickets we want to
 	// generate and put into the queue per second. If the requested TPS is more
 	// than the matchmaker can manage in a second, it will do as many as it
