@@ -97,10 +97,12 @@ var (
 		Type: pb.MatchmakingFunctionSpec_GRPC,
 	}
 
-	// If the MMF used by this game mode needs to make a backfill request for
-	// additional tickets, it should use these MMFs to service that backfill
-	// request. (The pb.MmfRequest.Profile will be generated at backfill
-	// request time according to what kinds of tickets are required).
+	// If an MMF invocation needs to make a backfill request for an incomplete
+	// match to find additional tickets in future matchmaking cycles, it must
+	// define what MMFs should be invoked to service that backfill request.
+	// (This example generates the rest of the pb.MmfRequest such as the
+	// Profile backfill request in the mmf according to what kinds of tickets
+	// are required).
 	BackfillMMFs, _ = anypb.New(&pb.MmfRequest{Mmfs: []*pb.MatchmakingFunctionSpec{Fifo}})
 
 	// Game mode specifications
@@ -113,7 +115,7 @@ var (
 			"desiredRosterLen":  4,
 			"minRosterLen":      2,
 		}), map[string]*anypb.Any{
-			ex.MMFRequestKey: BackfillMMFs,
+			ex.MMFRequestKey: BackfillMMFs, // Use FIFO MMF for SoloDuel backfill requests.
 		}),
 	}
 
@@ -135,57 +137,88 @@ var (
 			"dpsMaxPerRoster":     2,
 			"maxTicketsPerRoster": 5,
 		}), map[string]*anypb.Any{
-			ex.MMFRequestKey: BackfillMMFs,
+			ex.MMFRequestKey: BackfillMMFs, // Use FIFO MMF for HeroShooter backfill requests.
 		}),
 	}
 
-	// Nested map structure defining which game modes are available in which
-	// data centers. This mocks out one Agones fleet in each region. It is
-	// assumed that game servers specified in that fleet.GameServerTemplate are
-	// able to host a match session from any of the provided game modes.
+	// Map of game modes on offer in which GCP zones. If a zone doesn't appear
+	// in this map, then no matchmaking profile will be initialized for it by
+	// the game server managment integration (it will not participate in
+	// matchmaking)
 	//
-	// There are many ways you could do this, this approach organizes the
-	// fleets into geographic 'categories' and drills all the way down to which
-	// game mode is available in each zonal fleet.
-	// e.g. FleetConfig[category][region][GCP_zone] = [gamemode,...]
+	// This is an example used by our automated testing. In an actual
+	// matchmaker, your game server director 'main' package would define which
+	// game modes have game servers available in each zone of your
+	// infrastructure, and instantiate the GSDirector struct using that custom
+	// GameModesInZone map.
+	GameModesInZone = map[string][]*GameMode{
+		"asia-northeast1-a": []*GameMode{SoloDuel},
+	}
+
+	// Map of filter sets (held in pb.Pool structs, for easy combination) to
+	// regions. In most cases, you probably only need to make a filter for each
+	// region defining the min and max pings for tickets to play in those
+	// zones.
 	//
-	// In a production system, where you get this information is based on
-	// how you operate your infrastructure. For example:
-	//  - read this from your infrastructure-as-code repository (e.g. where
-	//  you've checked in something like terraform code)
-	// - query your infrastructure layer directly (e.g. using gcloud)
-	FleetConfig = map[string]map[string]map[string][]*GameMode{
-		"APAC": map[string]map[string][]*GameMode{
-			"JP_Tokyo": map[string][]*GameMode{
-				"asia-northeast1-a": []*GameMode{
-					SoloDuel,
+	// This is an example used by our automated testing. In an actual matchmaker,
+	// your game server director 'main' package would define filters for each zone
+	// that works for your infrastructure, and instantiate the GSDirector struct
+	// using that custom ZonePools map.
+	ZonePools = map[string]*pb.Pool{
+		"asia-northeast1-a": &pb.Pool{
+			DoubleRangeFilters: []*pb.Pool_DoubleRangeFilter{
+				&pb.Pool_DoubleRangeFilter{
+					DoubleArg: "ping.asia-northeast1-a",
+					Minimum:   1,
+					Maximum:   120,
 				},
 			},
 		},
+		// All other zones aren't used currently and are included for
+		// instructional purposes.
+		"asia-northeast3-b":      &pb.Pool{},
+		"asia-south2-c":          &pb.Pool{},
+		"australia-southeast1-c": &pb.Pool{},
+		"europe-central2-b":      &pb.Pool{},
+		"europe-west3-a":         &pb.Pool{},
+		"me-central2-a":          &pb.Pool{},
+		"us-east4-b":             &pb.Pool{},
+		"us-west2-c":             &pb.Pool{},
+		"southamerica-east1-c":   &pb.Pool{},
+		"africa-south1-b":        &pb.Pool{},
 	}
-	//"APAC": map[string]map[string][]*GameMode{
-	//"KR_Seoul":  "asia-northeast3-b",
-	//"IN_Delhi":  "asia-south2-c",
-	//"AU_Sydney": "australia-southeast1-c",
 
-	//"EMEA": map[string]map[string][]*GameMode{
-	//	"PL_Warsaw":    "europe-central2-b",
-	//	"DE_Frankfurt": "europe-west3-a",
-	//	"SA_Dammam":    "me-central2-a",
-	//},
-
-	//"NA": map[string]map[string][]*GameMode{
-	//	"US_Ashburn":    "us-east4-b",
-	//	"US_LosAngeles": "us-west2-c",
-	//},
-
-	//"SA": map[string]map[string][]*GameMode{
-	//	"BR_SaoPaulo": "southamerica-east1-c",
-	//},
-
-	//"Africa": map[string]map[string][]*GameMode{
-	//	"ZA_Johannesburg": "africa-south1-b",
-	//},
+	// Nested map structure defining which game modes are available in which
+	// data centers. This mocks out one Agones fleet in each region which can
+	// host a match session from any of the provided game modes.
+	//
+	// This is an example used by our automated testing. In an actual matchmaker,
+	// your game server director 'main' package would define a FleetConfig
+	// that works for your infrastructure, and instantiate the GSDirector struct
+	// using that custom FleetConfig.
+	FleetConfig = map[string]map[string]string{
+		"APAC": map[string]string{
+			"JP_Tokyo":  "asia-northeast1-a",
+			"KR_Seoul":  "asia-northeast3-b",
+			"IN_Delhi":  "asia-south2-c",
+			"AU_Sydney": "australia-southeast1-c",
+		},
+		"EMEA": map[string]string{
+			"PL_Warsaw":    "europe-central2-b",
+			"DE_Frankfurt": "europe-west3-a",
+			"SA_Dammam":    "me-central2-a",
+		},
+		"NA": map[string]string{
+			"US_Ashburn":    "us-east4-b",
+			"US_LosAngeles": "us-west2-c",
+		},
+		"SA": map[string]string{
+			"BR_SaoPaulo": "southamerica-east1-c",
+		},
+		"Africa": map[string]string{
+			"ZA_Johannesburg": "africa-south1-b",
+		},
+	}
 
 	NoSuchAllocationSpecError = errors.New("No such AllocationSpec exists")
 )
@@ -535,16 +568,20 @@ func (m *MockAgonesIntegration) processGameServerUpdates() {
 // provided fleetConfig, and starts a mock Kubernetes Informer that
 // asynchronously watches for changes to Agones Game Server objects.
 // https://agones.dev/site/docs/guides/access-api/#best-practice-using-informers-and-listers
-func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]map[string][]*GameMode) (err error) {
+//
+// Init should be called once and only once, after defining the externally-visible
+// parts of the MockAgonesIntegration structure that are desired, and before calling
+// the gsdirector.Run() function.
+func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, zonePools map[string]*pb.Pool, gameModesInZone map[string][]*GameMode) (err error) {
 
 	m.Log.Debug("Initializing matching parameters")
 
-	// copyPoolFilters copies the filters from src pool to dest pool, allowing us
+	// appendPoolFilters copies the filters from src pool to dest pool, allowing us
 	// to combine filters from different pools to create pools dynamically.
 	//
 	// NOTE: If the destination contains a CreationTimeFilter and the source does
 	// not, the destination CreationTimeFilter will be preserved.
-	copyPoolFilters := func(src *pb.Pool, dest *pb.Pool) {
+	appendPoolFilters := func(dest *pb.Pool, src *pb.Pool) *pb.Pool {
 		dest.TagPresentFilters = append(dest.TagPresentFilters, src.GetTagPresentFilters()...)
 		dest.DoubleRangeFilters = append(dest.DoubleRangeFilters, src.GetDoubleRangeFilters()...)
 		dest.StringEqualsFilters = append(dest.StringEqualsFilters, src.GetStringEqualsFilters()...)
@@ -555,7 +592,7 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]map[strin
 		if src.GetCreationTimeRangeFilter() != nil {
 			dest.CreationTimeRangeFilter = src.GetCreationTimeRangeFilter()
 		}
-		return
+		return dest
 	}
 
 	// In-memory game server state tracking maps init
@@ -569,8 +606,8 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]map[strin
 	// specified in the fleetConfig
 	var xxHash [16]byte
 	for category, regions := range fleetConfig {
-		for region, zones := range regions {
-			for zone, modes := range zones {
+		for region, zone := range regions {
+			if modes, exists := gameModesInZone[zone]; exists {
 
 				// Create a new mock GameServer set for this fleet.
 				mGSSet := &mockGameServerSet{
@@ -597,21 +634,17 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]map[strin
 				})
 				fLogger.Debug("Adding matching parameters to fleet")
 
-				// Construct a pool with filters to find players near this zone.
-				zonePool := &pb.Pool{
-					DoubleRangeFilters: []*pb.Pool_DoubleRangeFilter{
-						&pb.Pool_DoubleRangeFilter{
-							DoubleArg: fmt.Sprintf("ping.%v", zone),
-							Minimum:   1,
-							Maximum:   120,
-						},
-					},
-				}
-
 				// Make an array of all the matchmaking profiles that apply to
 				// this fleet, one profile per game mode.
 				mpa := &mmfParametersAnnotation{mmfParams: make([]string, 0)} // String version to attach to k8s metadata
 				mGSSet.server.mmfParams = make([]*pb.MmfRequest, 0)           // protobuf version to send to Open Match.
+
+				// retrieve filters for this specific datacenter.
+				zonePool, exists := zonePools[zone]
+				if !exists {
+					zonePool = &pb.Pool{}
+				}
+
 				for _, mode := range modes {
 
 					// By convention, profile names should use reverse-DNS notation
@@ -628,16 +661,17 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]map[strin
 						time.Now().UnixNano(),
 					)
 
-					// For every pool this game mode requests, also include the
-					// filters for this fleet.
+					// Generate sets of filters (held in pb.Pool structures) that define the kinds of
+					// tickets this game mode in this zone wants to use for matching.
 					composedPools := map[string]*pb.Pool{}
-					for pname, pool := range mode.Pools {
-						// Make a new pool with a name combining the fleet and the game mode's pool name
+					for pname, thisModePool := range mode.Pools {
 						composedName := fmt.Sprintf("%v.%v", fleetName, pname)
+						// Make a new pool with a name combining the fleet and the game mode's pool name
 						composedPool := &pb.Pool{Name: composedName}
+
 						// Add filters to this pool
-						copyPoolFilters(zonePool, composedPool)
-						copyPoolFilters(pool, composedPool)
+						composedPool = appendPoolFilters(composedPool, zonePool)
+						appendPoolFilters(composedPool, thisModePool)
 						composedPools[composedName] = composedPool
 					}
 
@@ -885,7 +919,7 @@ func (m *MockAgonesIntegration) GetMMFParams() []*pb.MmfRequest {
 // manager integration module used by our sample Director. In this example, the
 // MockAgonesIntegration satisfies this interface.
 type GameServerManager interface {
-	Init(map[string]map[string]map[string][]*GameMode) error
+	Init(map[string]map[string]string, map[string]*pb.Pool, map[string][]*GameMode) error
 	Allocate(string, *pb.Match) string
 	GetMMFParams() []*pb.MmfRequest
 	UpdateMMFRequest(string, *pb.MmfRequest) string
@@ -935,6 +969,8 @@ func (d *MockDirector) Run(ctx context.Context) {
 	var startTime time.Time
 	var proposedMatches []*pb.Match
 	var matches map[*pb.Match]string
+	assignments := make(map[string]bool)
+	assignmentTTL := make(map[time.Time][]string)
 
 	// Initialize metrics
 	if d.OtelMeterPtr != nil {
@@ -1146,6 +1182,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			}
 		}
 
+	ProposalsLoop:
 		for _, match := range proposedMatches {
 			mLogger := lLogger.WithFields(logrus.Fields{
 				"match_id": match.Id,
@@ -1165,7 +1202,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 			if rand.Intn(100) <= 1 {
 				mLogger.Warn("[TEST] this match randomly selected to be rejected")
 				rejectMatch(match)
-				continue
+				continue ProposalsLoop
 			}
 
 			// In the match extensions, look for the hash of the MMF request
@@ -1180,7 +1217,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 				// Couldn't get the hash, reject match.
 				mLogger.Errorf("Unable to get MmfRequest hash from returned match, rejecting: %v", err)
 				rejectMatch(match)
-				continue
+				continue ProposalsLoop
 			}
 
 			// Make sure the match request parameters we got back from the MMF
@@ -1192,7 +1229,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 				// No request with that hash in our list, reject match.
 				mLogger.Error("Unable to get pending MmfRequest, cannot return match, rejecting")
 				rejectMatch(match)
-				continue
+				continue ProposalsLoop
 			}
 
 			// Get the specification for how to allocate a server using the
@@ -1208,7 +1245,21 @@ func (d *MockDirector) Run(ctx context.Context) {
 			if err != nil {
 				mLogger.Errorf("Unable to retrieve allocation specification for game server manager for returned match, rejecting: %v", err)
 				rejectMatch(match)
-				continue
+				continue ProposalsLoop
+			}
+
+			// Check if this match contains any ticket IDs we've previously assigned, and
+			// if so, reject it.
+			for _, roster := range match.GetRosters() {
+				for _, ticket := range roster.GetTickets() {
+					// queue this ticket ID to be re-activated
+					if _, previouslyAssigned := assignments[ticket.GetId()]; previouslyAssigned {
+						mLogger.Errorf("ticketid %v previously assigned, rejecting", ticket.GetId())
+						rejectMatch(match)
+						continue ProposalsLoop
+					}
+
+				}
 			}
 
 			// See if the MMF returned new match request parameters in the
@@ -1247,8 +1298,20 @@ func (d *MockDirector) Run(ctx context.Context) {
 
 				// Stream out the assignments to the mmqueue
 				for _, roster := range match.GetRosters() {
+					// queue this ticket ID to be re-activated
 					d.AssignmentsChan <- roster
-					numTicketAssignments++
+					numTicketAssignments += int64(len(roster.GetTickets()))
+
+					// TODO
+					for _, ticket := range roster.GetTickets() {
+						assignments[ticket.GetId()] = true
+						ttl := time.Now().Add(time.Second * 600)
+						if _, nilArray := assignmentTTL[ttl]; nilArray {
+							assignmentTTL[ttl] = make([]string, 0)
+						}
+						assignmentTTL[ttl] = append(assignmentTTL[ttl], ticket.GetId())
+					}
+
 				}
 
 			} else {
@@ -1260,12 +1323,27 @@ func (d *MockDirector) Run(ctx context.Context) {
 
 		}
 
+		// TODO: temp hack to test assignment match rejection
+		// This is terribly inefficient, only for testing
+		for key, value := range assignmentTTL {
+			if time.Now().After(key) {
+				// Loop thru tix
+				for _, tid := range value {
+					// Stop tracking this ticktet's assignment
+					delete(assignments, tid)
+				}
+				// Stop tracking this ttl
+				delete(assignmentTTL, key)
+			}
+		}
+
 		// Calculate length of time to sleep before next loop.
 		// TODO: proper exp BO + jitter
 		// First, wait until ticket (re-)activations are complete
-		sleepDur := time.Until(startTime.Add(time.Millisecond * 1000)) // >= OM_CACHE_IN_WAIT_TIMEOUT_MS for efficiency's sake
+		// sleepDur := time.Until(startTime.Add(time.Millisecond * 1000)) // >= OM_CACHE_IN_WAIT_TIMEOUT_MS for efficiency's sake
+		sleepDur := time.Until(startTime.Add(time.Second * 5)) // >= OM_CACHE_IN_WAIT_TIMEOUT_MS for efficiency's sake
 		dur := time.Now().Sub(startTime)
-		sleepDur = (time.Millisecond * 1000) - dur
+		//sleepDur = (time.Millisecond * 1000) - dur
 
 		// Record metrics for this cycle
 		otelMatchesRejectedPerCycle.Record(ctx, numRejectedMatches)

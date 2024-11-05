@@ -78,11 +78,21 @@ var (
 			extensions.MMFRequestKey: backfillMMFs,
 		}),
 	}
-	fleetConfig = map[string]map[string]map[string][]*gsdirector.GameMode{
-		"APAC": map[string]map[string][]*gsdirector.GameMode{
-			"JP_Tokyo": map[string][]*gsdirector.GameMode{
-				"asia-northeast1-a": []*gsdirector.GameMode{soloduel},
+	gameModesInZone = map[string][]*gsdirector.GameMode{"asia-northeast1-a": []*gsdirector.GameMode{soloduel}}
+	zonePools       = map[string]*pb.Pool{
+		"asia-northeast1-a": &pb.Pool{
+			DoubleRangeFilters: []*pb.Pool_DoubleRangeFilter{
+				&pb.Pool_DoubleRangeFilter{
+					DoubleArg: "ping.asia-northeast1-a",
+					Minimum:   1,
+					Maximum:   120,
+				},
 			},
+		},
+	}
+	fleetConfig = map[string]map[string]string{
+		"APAC": map[string]string{
+			"JP_Tokyo": "asia-northeast1-a",
 		},
 	}
 )
@@ -141,7 +151,7 @@ func main() {
 	if cfg.GetBool("OTEL_SIDECAR") {
 		meterptr, otelShutdownFunc = metrics.InitializeOtel()
 	} else {
-		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(2225)
+		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"))
 	}
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 
@@ -184,7 +194,7 @@ func main() {
 	mmfFifo.Port = cfg.GetInt32("SOLODUEL_PORT")
 
 	// Initialize the game server manager used by the director
-	err := d.GSManager.Init(fleetConfig)
+	err := d.GSManager.Init(fleetConfig, zonePools, gameModesInZone)
 	if err != nil {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}

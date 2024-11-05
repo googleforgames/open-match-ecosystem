@@ -96,7 +96,7 @@ func main() {
 	if cfg.GetBool("OTEL_SIDECAR") {
 		meterptr, otelShutdownFunc = metrics.InitializeOtel()
 	} else {
-		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(2225)
+		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"))
 	}
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 

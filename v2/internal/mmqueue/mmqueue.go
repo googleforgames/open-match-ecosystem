@@ -187,29 +187,46 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		wg.Add(1)
 		defer wg.Done()
 
+		assigned := make(map[string]bool) // TODO
 		var assignment string
 		for roster := range q.AssignmentsChan {
 			// Get the assignment string
 			assignment = roster.GetAssignment().GetConnection()
 
 			// Loop through all tickets in the assignment roster
-			index := 0
 			var ticket *pb.Ticket
-			for index, ticket = range roster.GetTickets() {
+			for _, ticket = range roster.GetTickets() {
 				// TODO: in reality, this is where your matchmaking queue would
 				// return the assignment to the game client. This sample
 				// instead just logs the assignment.
-				bLogger.Debugf("Received ticket %v assignment: %v", ticket.GetId(), assignment)
+				//
 				// Stop tracking this ticket; it's matchmaking is complete.
 				// Your matchmaker may wish to instead keep this for a time (in
-				// case the game client needs to request the same assignment
-				// again later).
-				q.Tickets.Delete(ticket.GetId())
+				// case the game client should be allowed to ask for the same
+				// assignment again later).
+				if _, existed := q.Tickets.LoadAndDelete(ticket.GetId()); existed {
+					bLogger.Debugf("Received ticket %v assignment: %v", ticket.GetId(), assignment)
+					assigned[ticket.GetId()] = true
+					// Update metric
+					otelTicketAssignments.Add(ctx, 1)
+					// Get diff between now and ticket creation time, in milliseconds
+					queuedDur := time.Now().Sub(ticket.GetAttributes().GetCreationTime().AsTime())
+					// TODO add metric.WithAttributes(attribute.String()) for
+					// useful ways of slicing up the durations in a dashboard
+					// Record queue duration in fractional milliseconds
+					otelTicketQueuedDurations.Record(ctx, float64(queuedDur.Microseconds()/1000))
+				} else {
+					otelTicketDeletionFailures.Add(ctx, 1)
+					if _, previouslyassigned := assigned[ticket.GetId()]; previouslyassigned {
+						bLogger.Debugf("PREVIOUSLY ASSigned ticket %v assignment: %v", ticket.GetId(), assignment)
+					} else {
+						bLogger.Debugf("FAILED UNTRACKED ticket %v assignment: %v", ticket.GetId(), assignment)
+					}
+				}
 			}
 
-			// Update metric
-			otelTicketAssignments.Add(ctx, int64(index))
 		}
+
 	}()
 
 	// Don't exit the Run() function as long as any of the goroutines are

@@ -40,13 +40,15 @@ func Simple(ctx context.Context) *pb.Ticket {
 	// Make a fake game client matchmaking request
 	crTime := time.Now()
 	s := strconv.FormatInt(crTime.UnixNano(), 10)
+	minPing := 20
+	maxPing := 120
 	ticket := &pb.Ticket{
 		Attributes: &pb.Ticket_FilterableData{
 			// Make mock game client attributes.
 			Tags: []string{s},
 			DoubleArgs: map[string]float64{
 				// mock out a ping to this datacenter between 20-250ms
-				"ping.asia-northeast1-a": float64(rand.IntN(250-20) + 20),
+				"ping.asia-northeast1-a": float64(rand.IntN(maxPing-minPing) + minPing),
 			},
 			CreationTime: timestamppb.New(crTime),
 		},

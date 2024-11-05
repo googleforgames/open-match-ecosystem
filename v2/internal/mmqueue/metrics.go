@@ -32,9 +32,11 @@ var (
 	otelTicketAssignments                  otelmetrics.Int64Counter
 	otelTicketCreationRetries              otelmetrics.Int64Counter
 	otelTicketCreations                    otelmetrics.Int64Counter
+	otelTicketDeletionFailures             otelmetrics.Int64Counter
 	otelTicketsGeneratedPerSecond          otelmetrics.Int64ObservableGauge
 	otelTicketGenerationsAchievedPerSecond otelmetrics.Int64Histogram
 	otelActivationsPerCall                 otelmetrics.Int64Histogram
+	otelTicketQueuedDurations              otelmetrics.Float64Histogram
 )
 
 //nolint:cyclop // Cyclop linter sees each metric initialization as +1 cyclomatic complexity for some reason.
@@ -47,6 +49,15 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		metricsNamePrefix+"tps.request",
 		otelmetrics.WithDescription("Number of test tickets generations attempted per second"),
 		otelmetrics.WithUnit("tickets/second"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelTicketQueuedDurations, err = meter.Float64Histogram(
+		metricsNamePrefix+"ticket.queued_durations",
+		otelmetrics.WithDescription("Length of time spent by tickets in the queue"),
+		otelmetrics.WithUnit("ms"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -87,6 +98,14 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	otelTicketAssignments, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.assignments",
 		otelmetrics.WithDescription("Total ticket assignments received"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelTicketDeletionFailures, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.deletion.failures",
+		otelmetrics.WithDescription("Total ticket deletion failures"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
