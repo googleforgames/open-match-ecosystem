@@ -218,7 +218,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 				} else {
 					otelTicketDeletionFailures.Add(ctx, 1)
 					if _, previouslyassigned := assigned[ticket.GetId()]; previouslyassigned {
-						bLogger.Debugf("PREVIOUSLY ASSigned ticket %v assignment: %v", ticket.GetId(), assignment)
+						bLogger.Debugf("PREVIOUSLY ASSIGNED ticket %v assignment: %v", ticket.GetId(), assignment)
 					} else {
 						bLogger.Debugf("FAILED UNTRACKED ticket %v assignment: %v", ticket.GetId(), assignment)
 					}
