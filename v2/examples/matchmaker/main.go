@@ -117,15 +117,26 @@ func main() {
 
 	// Ticket creation config
 	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 3)
-	cfg.SetDefault("INITIAL_TPS", 10)
+	cfg.SetDefault("INITIAL_TPC", 10)
+	cfg.SetDefault("TICKET_CREATION_CYCLE_DURATION_MS", 1000)
+	cfg.SetDefault("TICKET_CREATION_CYCLES", math.MaxInt32)
 
 	// InvokeMatchmaking Function config
-	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)                               // Default is essentially forever
+	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)                               // math.MaxInt32 seconds is essentially forever
+	cfg.SetDefault("MM_CYCLE_MIN_DURATION_MS", 5000)                             // Director will sleep if the invokeMMFs didn't take at least this long.
 	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", math.MaxInt32) // Exit if consequtive matchmaking cycles come back empty
 
 	// MMF config
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
 	cfg.SetDefault("SOLODUEL_PORT", 50080)
+
+	// Assignment config
+	// Set this duration to slightly longer than your configured
+	// OM_CACHE_TICKET_TTL_MS and OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS config
+	// vars in om-core, added together. If you haven't manually set those
+	// config vars, you can see the default values in the om-core repository's
+	// 'internal/config/config.go' file.
+	cfg.SetDefault("ASSIGNMENT_TTL_MS", 1200000) // default 1200 secs = 10 mins
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -263,35 +274,36 @@ func main() {
 	})
 
 	// FOR TESTING ONLY
-	// Asynchronous goroutine that loops forever, attempting to queue
-	// the given number of tickets each second. Update the tps by sending an
-	// http GET to /tps/<NUM> as per the handler below.
-	q.SetTestTicketConfig(cfg.GetInt64("INITIAL_TPS"), mockClientTicket)
+	// Asynchronous goroutine that loops TICKET_CREATION_CYCLES number of
+	// times, attempting to queue the given number of tickets each cycle.
+	// Update the tpc by sending an http GET to /tpc/<NUM> as per the handler
+	// below.
+	q.SetTestTicketConfig(cfg.GetInt64("INITIAL_TPC"), mockClientTicket)
 	go q.GenerateTestTickets(ctx)
 
 	// Handler to update the (best effort) number of test tickets we want to
-	// generate and put into the queue per second. If the requested TPS is more
+	// generate and put into the queue per second. If the requested TPC is more
 	// than the matchmaker can manage in a second, it will do as many as it
 	// can. Set it to 0 to stop automatically creating tickets.
-	http.HandleFunc("/tps/{tixPerSec}", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/tpc/{tixPerCycle}", func(w http.ResponseWriter, r *http.Request) {
 
-		// Attempt to convert requested TPS string into an int64
-		rTPS, err := strconv.ParseInt(r.PathValue("tixPerSec"), 10, 64)
+		// Attempt to convert requested TPC string into an int64
+		rTPC, err := strconv.ParseInt(r.PathValue("tixPerCycle"), 10, 64)
 		if err != nil {
 			// Couldn't convert to int; maybe a typo in the http request?
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		// Hard cap of 10k per second to protect against mistyped http requests
-		if rTPS > 10000 {
+		if rTPC > 10000 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
 		// Update tixPerSec number, and generate tickets using the gameclient.Simple function.
-		q.SetTestTicketConfig(rTPS, mockClientTicket)
+		q.SetTestTicketConfig(rTPC, mockClientTicket)
 
-		logger.Infof("TPS set to %v", rTPS)
+		logger.Infof("TPC set to %v", rTPC)
 		w.WriteHeader(http.StatusOK)
 	})
 

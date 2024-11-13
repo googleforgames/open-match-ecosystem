@@ -29,15 +29,17 @@ var (
 
 	// Metric variable declarations are global, so they can be accessed directly in the application code.
 	// Metrics populated by the grpc function implementations in main.go.
-	otelTicketsRejected                 otelmetrics.Int64Counter
-	otelMMFResponseFailures             otelmetrics.Int64Counter
-	otelTicketActivationsPerCycle       otelmetrics.Int64Histogram
-	otelTicketAssignmentsPerCycle       otelmetrics.Int64Histogram
-	otelNewMMFRequestsProcessedPerCycle otelmetrics.Int64Histogram
-	otelMatchesRejectedPerCycle         otelmetrics.Int64Histogram
-	otelMatchesProposedPerCycle         otelmetrics.Int64Histogram
-	otelMMFsPerOMCall                   otelmetrics.Int64Histogram
-	otelMatchmakingCycleDuration        otelmetrics.Float64Histogram
+	otelMMFResponseFailures                otelmetrics.Int64Counter
+	otelTicketsRejectedPerCycle            otelmetrics.Int64Histogram
+	otelAssignedTicketsInMatchesPerCycle   otelmetrics.Int64Histogram
+	otelTicketActivationsPerCycle          otelmetrics.Int64Histogram
+	otelTicketAssignmentsPerCycle          otelmetrics.Int64Histogram
+	otelNewMMFRequestsProcessedPerCycle    otelmetrics.Int64Histogram
+	otelMatchesRejectedPerCycle            otelmetrics.Int64Histogram
+	otelMatchesWithAssignedTicketsPerCycle otelmetrics.Int64Histogram
+	otelMatchesProposedPerCycle            otelmetrics.Int64Histogram
+	otelMMFsPerOMCall                      otelmetrics.Int64Histogram
+	otelMatchmakingCycleDuration           otelmetrics.Float64Histogram
 )
 
 //nolint:cyclop // Cyclop linter sees each metric initialization as +1 cyclomatic complexity for some reason.
@@ -46,17 +48,25 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	var err error
 
 	// Initialize all declared Metrics
-	otelTicketsRejected, err = meter.Int64Counter(
-		metricsNamePrefix+"tickets.rejected",
-		otelmetrics.WithDescription("Total tickets rejected"),
+	otelMMFResponseFailures, err = meter.Int64Counter(
+		metricsNamePrefix+"mmf.reponse.failures",
+		otelmetrics.WithDescription("Total MMF response stream errors"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
 
-	otelMMFResponseFailures, err = meter.Int64Counter(
-		metricsNamePrefix+"mmf.reponse.failures",
-		otelmetrics.WithDescription("Total MMF response stream errors"),
+	otelTicketsRejectedPerCycle, err = meter.Int64Histogram(
+		metricsNamePrefix+"ticket.rejections",
+		otelmetrics.WithDescription("Total Number of tickets rejected per cycle due to rejected matches, server allocation failures, previously assigned tickets, etc"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelAssignedTicketsInMatchesPerCycle, err = meter.Int64Histogram(
+		metricsNamePrefix+"ticket.rejections.assigned",
+		otelmetrics.WithDescription("Number of tickets among those rejected per cycle due to being in a match with a ticket that was already assigned"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -88,7 +98,15 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelMatchesRejectedPerCycle, err = meter.Int64Histogram(
 		metricsNamePrefix+"matchmaking_cycle.match.rejections",
-		otelmetrics.WithDescription("Total tickets set to active, so they appear in pools"),
+		otelmetrics.WithDescription("Total number of proposed matches rejected per cycle due to server allocation failures, previously assigned tickets, etc"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelMatchesWithAssignedTicketsPerCycle, err = meter.Int64Histogram(
+		metricsNamePrefix+"matchmaking_cycle.match.rejections.assigned",
+		otelmetrics.WithDescription("Number of proposed matches among those rejected per cycle which contained one or more previously assigned tickets"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
