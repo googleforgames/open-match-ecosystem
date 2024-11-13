@@ -29,14 +29,15 @@ var (
 
 	// Metric variable declarations are global, so they can be accessed directly in the application code.
 	// Metrics populated by the grpc function implementations in main.go.
-	otelTicketAssignments                  otelmetrics.Int64Counter
-	otelTicketCreationRetries              otelmetrics.Int64Counter
-	otelTicketCreations                    otelmetrics.Int64Counter
-	otelTicketDeletionFailures             otelmetrics.Int64Counter
-	otelTicketsGeneratedPerSecond          otelmetrics.Int64ObservableGauge
-	otelTicketGenerationsAchievedPerSecond otelmetrics.Int64Histogram
-	otelActivationsPerCall                 otelmetrics.Int64Histogram
-	otelTicketQueuedDurations              otelmetrics.Float64Histogram
+	otelTicketAssignments                 otelmetrics.Int64Counter
+	otelTicketCreationRetries             otelmetrics.Int64Counter
+	otelTicketCreations                   otelmetrics.Int64Counter
+	otelTicketDeletionFailures            otelmetrics.Int64Counter
+	otelTicketsGeneratedPerCycle          otelmetrics.Int64ObservableGauge
+	otelTicketGenerationsAchievedPerCycle otelmetrics.Int64Histogram
+	otelTicketGenerationCycleDurations    otelmetrics.Int64Histogram
+	otelActivationsPerCall                otelmetrics.Int64Histogram
+	otelTicketQueuedDurations             otelmetrics.Float64Histogram
 )
 
 //nolint:cyclop // Cyclop linter sees each metric initialization as +1 cyclomatic complexity for some reason.
@@ -45,10 +46,9 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	var err error
 
 	// Initialize all declared Metrics
-	otelTicketsGeneratedPerSecond, err = meter.Int64ObservableGauge(
-		metricsNamePrefix+"tps.request",
-		otelmetrics.WithDescription("Number of test tickets generations attempted per second"),
-		otelmetrics.WithUnit("tickets/second"),
+	otelTicketsGeneratedPerCycle, err = meter.Int64ObservableGauge(
+		metricsNamePrefix+"tpc.request",
+		otelmetrics.WithDescription("Number of test tickets generations attempted per cycle (default 1 second)"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -71,9 +71,17 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketGenerationsAchievedPerSecond, err = meter.Int64Histogram(
-		metricsNamePrefix+"tps.actual",
-		otelmetrics.WithDescription("Actual number of tickets successfully created each second"),
+	otelTicketGenerationCycleDurations, err = meter.Int64Histogram(
+		metricsNamePrefix+"ticket.generation.cycle_duration",
+		otelmetrics.WithDescription("Actual duration of ticket creation cycles"),
+		otelmetrics.WithUnit("ms"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+	otelTicketGenerationsAchievedPerCycle, err = meter.Int64Histogram(
+		metricsNamePrefix+"tpc.actual",
+		otelmetrics.WithDescription("Actual number of tickets successfully created each cycle"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)

@@ -59,7 +59,7 @@ func InitializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
 		// Open Match attributes
 		resource.WithAttributes(
 			semconv.ServiceNamespaceKey.String("matchmaker"),
-			semconv.ServiceNameKey.String("queue"),
+			semconv.ServiceNameKey.String("example"),
 			semconv.ServiceVersionKey.String("2.0.0"),
 		),
 	)
@@ -83,7 +83,7 @@ func InitializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
 	// Otel meter and meterprovider init
 	provider := metric.NewMeterProvider(metric.WithResource(res),
 		metric.WithReader(metric.NewPeriodicReader(exporter)))
-	meter := provider.Meter("open_match.core")
+	meter := provider.Meter("matchmaker.example")
 
 	return &meter, provider.Shutdown
 }
@@ -135,7 +135,7 @@ func InitializeOtelWithLocalProm(port int) (*otelmetrics.Meter, func(context.Con
 
 	// Otel meter and meterprovider init
 	provider := metric.NewMeterProvider(metric.WithResource(res), metric.WithReader(exporter))
-	meter := provider.Meter("open_match.core")
+	meter := provider.Meter("matchmaker.example")
 
 	return &meter, provider.Shutdown
 }
