@@ -103,6 +103,8 @@ func NewWithLogger(l *logrus.Logger) *mmfServer {
 // proto/v2/mmf.proto. This is the function you will want to customize.
 func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
+	startTime := time.Now()
+
 	// Use the helper function to reconstruct the incoming request from partial
 	// 'chunked' requests.
 	req, err := server.GetChunkedRequest(stream)
@@ -326,7 +328,8 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		// Keep track of the number of matches sent
 		matchNum++
 	}
-	s.logger.Infof("Returning %v matches", matchNum)
+	dur := time.Since(startTime)
+	s.logger.Infof("Returning %v matches in %.03f seconds", matchNum, float64(dur.Milliseconds())/1000.0)
 
 	return nil
 }
