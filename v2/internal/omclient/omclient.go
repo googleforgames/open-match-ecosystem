@@ -38,6 +38,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+var MMFsComplete = errors.New("Open Match HTTP client detected that the stream of matches from OM was complete and cancelled the context")
+
 type RestfulOMGrpcClient struct {
 	Client      *http.Client
 	Log         *logrus.Logger
@@ -99,16 +101,22 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 			"CreateTicketsRequest": reqPb,
 		}).Errorf("CreateTicket failed: %v", err)
 		//TODO: switch resp.Header?
+		resp.Body.Close() // make sure the body is closed.
 		return "", err
 	}
 	if err != nil { // HTTP library error
+		// ERRO[59639] CreateTicket failed: Post "http://localhost:8080/tickets": dial tcp [::1]:8080: connect: cannot assign requested address
 		logger.WithFields(logrus.Fields{
 			"CreateTicketsRequest": reqPb,
 		}).Errorf("CreateTicket failed: %v", err)
+		// Shouldn't have a response but if somehow there is one, make sure it is closed.
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return "", err
 	}
 
-	// Read HTTP response body
+	// Read & close HTTP response body
 	body, err := readAllBody(*resp, logger)
 	if err != nil {
 		// Mark as a permanent error so the backoff library doesn't retry this REST call
@@ -242,6 +250,11 @@ func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToA
 			activateTicketCall := func() error {
 				logger.Tracef("ActivateTicket call with %v tickets: %v...", len(thisBatch), thisBatch[0])
 				resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets:activate", req)
+				defer func(resp *http.Response) {
+					if resp != nil {
+						resp.Body.Close()
+					}
+				}(resp)
 				// TODO: In reality, the error has details fields, telling us which ticket couldn't
 				// be activated, but we're not processing those or passing them on yet, we just act as
 				// though all activations succeeded or all activations failed.
@@ -286,8 +299,8 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	})
 
 	// Have to cancel the context to tell the om-core server we're done reading from the stream.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(MMFsComplete)
 
 	// Marshal protobuf request to JSON for grpc-gateway HTTP call
 	req, err := protojson.Marshal(reqPb)
@@ -451,11 +464,14 @@ func (rc *RestfulOMGrpcClient) ValidateConnection(ctx context.Context, url strin
 		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()},
 	})
 	// Try to create the dummy ticket.
-	_, err = rc.Post(ctx,
+	resp, err := rc.Post(ctx,
 		rc.Log.WithFields(logrus.Fields{
 			"operation": "proxy_ValidateConnection",
 		}),
 		url, "/", buf)
+	if resp != nil {
+		resp.Body.Close()
+	}
 	return err
 }
 
