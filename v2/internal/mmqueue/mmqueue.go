@@ -39,7 +39,7 @@ import (
 )
 
 var (
-	tpsMutex  sync.Mutex
+	tpcMutex  sync.Mutex
 	newTicket func(context.Context) *pb.Ticket
 )
 
@@ -54,7 +54,7 @@ type MatchmakerQueue struct {
 	ClientRequestChan chan *ClientRequest
 	AssignmentsChan   chan *pb.Roster
 	OtelMeterPtr      *metric.Meter
-	TPS               int64
+	TPC               int64
 }
 
 type ClientRequest struct {
@@ -67,7 +67,7 @@ type ClientRequest struct {
 func (q *MatchmakerQueue) Run(ctx context.Context) {
 	logger := q.Log.WithFields(logrus.Fields{
 		"app":       "matchmaker",
-		"component": "queue",
+		"component": "matchmaking_queue",
 	})
 
 	// Var init
@@ -76,24 +76,26 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 
 	// Initialize metrics
 	if q.OtelMeterPtr != nil {
-		logger.Tracef("Initializing otel metris")
+		logger.Tracef("Initializing otel metrics")
 		registerMetrics(q.OtelMeterPtr)
-	}
-	// This inline function is a simple callback that open telemetry uses to read
-	// the current TPS
-	meter := *q.OtelMeterPtr
-	_, err := meter.RegisterCallback(
-		func(ctx context.Context, o metric.Observer) error {
-			// TPS can be updated asynchronously, so we protect reading it with a lock.
-			tpsMutex.Lock()
-			o.ObserveInt64(otelTicketsGeneratedPerSecond, q.TPS)
-			tpsMutex.Unlock()
-			return nil
-		},
-		otelTicketsGeneratedPerSecond,
-	)
-	if err != nil {
-		logger.Fatalf("Failed to set up tps gauge: %v", err)
+		// This inline function is a simple callback that open telemetry uses to read
+		// the current TPC
+		meter := *q.OtelMeterPtr
+		_, err := meter.RegisterCallback(
+			func(ctx context.Context, o metric.Observer) error {
+				// TPC can be updated asynchronously, so we protect reading it with a lock.
+				tpcMutex.Lock()
+				o.ObserveInt64(otelTicketsGeneratedPerCycle, q.TPC)
+				tpcMutex.Unlock()
+				return nil
+			},
+			otelTicketsGeneratedPerCycle,
+		)
+		if err != nil {
+			logger.Fatalf("Failed to set up tpc gauge: %v", err)
+		}
+	} else {
+		logger.Warnf("Unable to add matchmaking queue metrics to the OTEL configuration")
 	}
 
 	// Control number of concurrent requests by creating ticket creation 'slots'
@@ -141,8 +143,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 				otelTicketCreations.Add(ctx, 1)
 
 				// TODO: in reality, we should only send StatusOK back to the client once
-				// the ticket is successfully activated, but haven't written the code to get
-				// activation errors back from Open Match yet
+				// the ticket is successfully activated. WIP.
 				request.ResultChan <- http.StatusOK
 
 			}(request)
@@ -168,15 +169,25 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		// by the omclient to distinguish between logs for initial ticket activation
 		// and re-activation after a failed matching attempt.
 		ctx := context.WithValue(ctx, "activationType", "activate")
-		//aLogger := q.Log.WithFields(logrus.Fields{
-		//	"component": "matchmaking_queue",
-		//	"operation": "ticket_activation",
-		//})
 
 		q.OmClient.ActivateTickets(ctx, ticketIdsToActivate)
 	}()
 
 	// goroutine to process incoming assignments.
+	//
+	// NOTE: the assignment api endpoints in om-core are deprecated, and
+	// shouldn't be used in production.  This implementation assumes you have
+	// some other way of getting assignments from your game server director to
+	// your matchmaking queue OTHER than going through om-core, but isn't
+	// specific about what that 'other way' is. This just reads all incoming
+	// assignments from the AssignmentsChan and processes them. In a real
+	// implementation, you'd write some code to get assignments from whatever
+	// is handling them and put them in the channel.
+	//
+	// It is recommended that you incorporate your assignment storage and
+	// retreival into the part of your online services suite responsible for
+	// returning player online status, like a player online event bus or
+	// presence service.
 	go func() {
 		bLogger := q.Log.WithFields(logrus.Fields{
 			"operation": "ticket_assignment",
@@ -234,17 +245,17 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 	wg.Wait()
 }
 
-// SetTPS instructs the test function GenerateTestTickets() to make `newTPS`
+// SetTPC instructs the test function GenerateTestTickets() to make `newTPC`
 // tickets per second using `ticketCreationFunc()`. Example mock client ticket
 // creations functions can be found in internal/mocks/gameclient
-func (q *MatchmakerQueue) SetTestTicketConfig(newTPS int64,
+func (q *MatchmakerQueue) SetTestTicketConfig(newTPC int64,
 	ticketCreationFunc func(context.Context) *pb.Ticket) {
 
 	// This can be updated at any time by the calling code, so protect it with a mutex
-	tpsMutex.Lock()
-	q.TPS = newTPS
+	tpcMutex.Lock()
+	q.TPC = newTPC
 	newTicket = ticketCreationFunc
-	tpsMutex.Unlock()
+	tpcMutex.Unlock()
 }
 
 // Test the queue by generating tickets every second.
@@ -255,15 +266,15 @@ func (q *MatchmakerQueue) SetTestTicketConfig(newTPS int64,
 // To use this function:
 //   - instante your mmqueue object (by convention, in a variable named 'q')
 //   - asynchronously run the queue: `go q.Run(ctx)`
-//   - to set up ticket generation, send a non-zero TPS & a ticket creation function to the SetTPS function:
+//   - to set up ticket generation, send a non-zero TPC & a ticket creation function to the SetTPC function:
 //     `q.SetTestTicketConfig(10, <ticket creation function>)`
 //   - asynchronously run the test ticket generator: `go q.GenerateTestTickets(ctx)`
-//   - to stop generating tickets, send 0 to the SetTPS function:
+//   - to stop generating tickets, send 0 to the SetTPC function:
 //     `q.SetTestTicketConfig(0, <ticket creation function>)`
 func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
-	tpsLogger := q.Log.WithFields(logrus.Fields{"component": "generate_tickets"})
+	tpcLogger := q.Log.WithFields(logrus.Fields{"component": "tester", "operation": "generate_tickets"})
 
-	for {
+	for i := q.Cfg.GetInt("TICKET_CREATION_CYCLES"); i > 0; i-- {
 		// Channel where we will put one struct for each ticket we want to create this second.
 		tq := make(chan struct{})
 
@@ -271,18 +282,23 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 		var wg sync.WaitGroup
 		wg.Add(1)
 
-		// Loop for 1 second, making as many tickets as we can, up to the requested TPS.
-		tpsLogger.Trace("generating tickets until deadline")
+		// Loop for 1 second, making as many tickets as we can, up to the requested TPC.
+		tpcLogger.Trace("generating tickets until deadline")
 		go func() {
 			defer wg.Done()
 
-			// Start a new cycle after 1 second, whether we queued the requested TPS or not.
-			deadline := time.NewTimer(1 * time.Second)
+			// Start a new cycle after 1 second, whether we queued the requested TPC or not.
+			deadlineDur := time.Millisecond * time.Duration(q.Cfg.GetInt("TICKET_CREATION_CYCLE_DURATION_MS"))
+			deadline := time.NewTimer(deadlineDur)
+			startTime := time.Now()
 
 			var numTixQueued int64
+			var ticketCounterMutex sync.Mutex
+			durationRecorded := false
+			var dur time.Duration
 			for {
 				select {
-				// Read all the structs put into the channel by the tps goroutine below.
+				// Read all the structs put into the channel by the tpc goroutine below.
 				case _, ok := <-tq:
 					if ok {
 						// There are still structs in the channel representing tickets we want
@@ -298,32 +314,66 @@ func (q *MatchmakerQueue) GenerateTestTickets(ctx context.Context) {
 							Ticket: newTicket(ctx),
 						}
 
-						// In tests, we simply discard the ticket creation results.
+						// In this example, we simply count the ticket creation results.
 						go func() {
-							_ = <-rChan
+							status := <-rChan
+							success := int64(1)
+							if status == http.StatusRequestTimeout {
+								success = int64(0)
+							}
+							ticketCounterMutex.Lock()
+							numTixQueued += success
+							ticketCounterMutex.Unlock()
 						}()
 
-						numTixQueued++
+					} else {
+						if !durationRecorded {
+							// no more tickets to create this second, record how long elapsed
+							dur = time.Since(startTime)
+							otelTicketGenerationCycleDurations.Record(ctx, dur.Milliseconds())
+							durationRecorded = true
+						}
 					}
+
 				case <-deadline.C:
 					// deadline reached; return from this function and call the deferred
 					// waitgroup Done(), which signals that we've processed
 					// as many tickets as we can this second
-					tpsLogger.Tracef("DEADLINE EXCEEDED: %v/%v tps (achieved/requested)", numTixQueued, q.TPS)
-					otelTicketGenerationsAchievedPerSecond.Record(ctx, numTixQueued)
+					ticketCounterMutex.Lock()
+					numTixCreationsAchieved := numTixQueued
+					ticketCounterMutex.Unlock()
+
+					if !durationRecorded {
+						dur = time.Since(startTime)
+						// Record length of the cycle
+						otelTicketGenerationCycleDurations.Record(ctx, dur.Milliseconds())
+					}
+					// Record successful ticket generations this cycle
+					otelTicketGenerationsAchievedPerCycle.Record(ctx, numTixCreationsAchieved)
+
+					// Cycle status log once per cycle
+					tpcLogger.Infof("matchmaker queue ticket creation cycle %010d/%010d: ticket creations %05d/%05d (achieved/requested), time elapsed %.3f/%.3f seconds",
+						q.Cfg.GetInt("TICKET_CREATION_CYCLES")+1-i,
+						q.Cfg.GetInt("TICKET_CREATION_CYCLES")+1,
+						numTixCreationsAchieved,
+						q.TPC,
+						float64(dur.Milliseconds())/1000.0,
+						float64(deadlineDur.Milliseconds())/1000.0,
+					)
+
 					return
 				}
 			}
 		}()
 
-		// Simple tps goroutine that puts one struct in the channel for every ticket
+		// Simple tpc goroutine that puts one struct in the channel for every ticket
 		// we want to generate this second.
 		go func() {
-			// TPS can be updated at any time, so protect it with a mutex.
-			tpsMutex.Lock()
-			thisTPS := q.TPS
-			tpsMutex.Unlock()
-			for i := thisTPS; i > 0; i-- {
+			// TPC can be updated at any time, so protect it with a mutex.
+			tpcMutex.Lock()
+			thisTPC := q.TPC
+			tpcMutex.Unlock()
+			for i := thisTPC; i > 0; i-- {
 				tq <- struct{}{}
 			}
 			close(tq)
