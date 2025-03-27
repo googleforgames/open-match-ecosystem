@@ -1,0 +1,29 @@
+# example usage:
+# gcloud builds submit --async \
+#   --substitutions=COMMIT_SHA=latest,_JOB_NAME=matchmaker-example,_GOOGLE_BUILDABLE=./examples/matchmaker
+#
+# or
+# gcloud builds submit --async \
+#  --substitutions=COMMIT_SHA=latest,_JOB_NAME=soloduel,_GOOGLE_BUILDABLE=./examples/mmf/
+substitutions:
+  _ARTIFACT_REGISTRY_URI: asia-northeast1-docker.pkg.dev/open-match-dev/open-match
+  _JOB_NAME: matchmaker-example 
+  _GOOGLE_BUILDABLE: ./examples/matchmaker/
+steps:
+  # Build container image with Cloud Buildpacks
+  - name: 'gcr.io/k8s-skaffold/pack'
+    entrypoint: pack
+    args: 
+      - build
+      - '${_ARTIFACT_REGISTRY_URI}/${_JOB_NAME}:${COMMIT_SHA}'
+      - --builder
+      - gcr.io/buildpacks/builder:latest
+      - --network
+      - cloudbuild
+      - --env
+      - GOOGLE_BUILDABLE=${_GOOGLE_BUILDABLE}
+  # Push container image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: 
+      - push
+      - '${_ARTIFACT_REGISTRY_URI}/${_JOB_NAME}:${COMMIT_SHA}'
