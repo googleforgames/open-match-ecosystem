@@ -16,14 +16,14 @@
 
 substitutions:
    # Cloud deploy vars
-  _ARTIFACT_REGISTRY_URI: asia-northeast1-docker.pkg.dev/open-match-dev/open-match
+  _ARTIFACT_REGISTRY_URI: us-docker.pkg.dev/open-match-public-images/open-match2
   _JOB_NAME: matchmaker-example 
   _SERVICE_ACCOUNT: matchmaker-example-identity
-  _RUN_REGION: asia-northeast1
+  _RUN_REGION: us-central1
 
    # Application environment vars
-  _OM_CORE_ADDR: https://om-core-356051189921.asia-northeast1.run.app
-  _SOLODUEL_ADDR: https://mmf-356051189921.asia-northeast1.run.app
+  _OM_CORE_ADDR: OM_CORE_CLOUD_RUN_URL
+  _SOLODUEL_ADDR: SOLODUEL_CLOUD_RUN_URL
   _SOLODUEL_PORT: "443"
   _LOGGING_LEVEL: info 
 steps:
