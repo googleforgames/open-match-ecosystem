@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -172,9 +173,17 @@ func main() {
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
 		OmClient: &omclient.RestfulOMGrpcClient{
-			Client: &http.Client{},
-			Log:    log,
-			Cfg:    cfg,
+			Client: &http.Client{
+				Transport: &http.Transport{
+					MaxIdleConns:        100,              // Maximum idle connections to keep open
+					MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+					IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
+					DisableKeepAlives:   false,            // Make sure keep-alives are enabled
+				},
+				Timeout: 30 * time.Second,
+			},
+			Log: log,
+			Cfg: cfg,
 		},
 		Cfg:               cfg,
 		Log:               log,
