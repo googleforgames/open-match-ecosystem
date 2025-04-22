@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: matchmaker-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: matchmaker-example
+  template:
+    metadata:
+      labels:
+        app: matchmaker-example
+    spec:
+      containers:
+      - name: matchmaker-example
+        image: us-docker.pkg.dev/open-match-public-images/open-match2/matchmaker-example
+        ports:
+        - containerPort: 8080
+        env:
+        - name: OM_CORE_ADDR
+          value: "http://open-match-service.default.svc.cluster.local:50504"
+        - name: SOLODUEL_ADDR
+          value: "http://soloduel-service.default.svc.cluster.local"
+        - name: SOLODUEL_PORT
+          value: "80"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: matchmaker-example-service
+spec:
+  selector:
+    app: matchmaker-example
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: LoadBalancer
