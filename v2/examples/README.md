@@ -1,3 +1,4 @@
+この文書を日本語で [Open Match 2 サンプルマッチメーカーのドキュメント（日本語版）](README-JP.md)
 # Open Match 2 Examples
 
 The example matchmaker in the v2/ directory demonstrates how to build a complete matchmaking system using Open Match 2\. It is designed to be flexible, supporting both a monolithic deployment for local development and a decoupled, microservices-based architecture recommended for production.
