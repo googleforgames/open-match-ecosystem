@@ -81,6 +81,7 @@ import (
 	//soloduelServer "open-match.dev/functions/golang/soloduel"
 	//mmf "open-match.dev/mmf/server"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
 	"open-match.dev/open-match-ecosystem/v2/internal/mmqueue"
@@ -119,6 +120,9 @@ func main() {
 	cfg.SetDefault("OTEL_SIDECAR", "true")
 	cfg.SetDefault("OTEL_PROM_PORT", 2224)
 
+	// Assignment distribution config
+	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "channel")
+
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
 
@@ -134,6 +138,76 @@ func main() {
 	}
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 
+	// Initialize assignment distribution
+	var cleanup func()
+	var receiver assignmentdistributor.Receiver
+	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
+	case "pubsub":
+		// NOTE: If using pubsub to send assignments from your director to your matchmaking queue,
+		// make sure you have sufficient quota for subscriptions in your GCP project. Each instance of the
+		// mmqueue will make a unique topic subscription.
+		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
+		projectID := cfg.GetString("GCP_PROJECT_ID")
+		topicID := cfg.GetString("ASSIGNMENT_TOPIC_ID")
+
+		// Get Pub/Sub specific configuration
+		if projectID == "" || topicID == "" {
+			log.Fatalln("For 'pubsub' assignment distribution, GCP_PROJECT_ID and ASSIGNMENT_TOPIC_ID must be set")
+		}
+
+		// Create a Pub/Sub client
+		ctx := context.Background()
+		client, err := pubsub.NewClient(ctx, projectID)
+		if err != nil {
+			log.Fatalf("Failed to initialize pubsub client to receive assignments: %v", err)
+		}
+
+		// Unique subscription name for each application instance.
+		subID := fmt.Sprintf("mmqueue-%s-sub", uuid.NewString())
+		log.Infof("Creating subscription: %s", subID)
+		sub, err := client.CreateSubscription(ctx, subID, pubsub.SubscriptionConfig{
+			Topic:       topic,
+			AckDeadline: 20 * time.Second,
+			// The subscription will be automatically deleted by GCP after 24 hours
+			// of inactivity. This is a safeguard against orphaned resources if
+			// the app crashes without cleaning up.
+			ExpirationPolicy: 24 * time.Hour,
+		})
+		if err != nil {
+			log.Fatalf("Failed to create Pub/Sub subscription: %v", err)
+		}
+
+		// Instantiate the Pub/Sub receiver
+		receiver = distribution.NewPubSubReceiver(sub, log)
+
+		// cleanup function for Pub/Sub
+		receiverCleanup = func() {
+			log.Infof("Cleaning up assignment pubsub subscription %s...", sub.ID())
+
+			// Use a new, short-lived context to ensure cleanup runs.
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if err := sub.Delete(cleanupCtx); err != nil {
+				log.Errorf("Failed to delete subscription %s: %v", sub.ID(), err)
+			} else {
+				log.Infof("Successfully deleted subscription %s", sub.ID())
+			}
+
+			// close the client connection.
+			client.Close()
+		}
+	case "channel":
+		fallthrough // default is 'channel'
+	default:
+		log.Info("Using Go channels for assignment distribution")
+		assignmentsChan := make(chan *pb.Roster)
+		receiver = distribution.NewChannelReceiver(assignmentsChan)
+		receiverCleanup = func() {
+			log.Info("No longer monitoring assigment channel")
+		}
+	}
+
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
 		OmClient: &omclient.RestfulOMGrpcClient{
@@ -141,11 +215,11 @@ func main() {
 			Log:    log,
 			Cfg:    cfg,
 		},
-		Cfg:               cfg,
-		Log:               log,
-		ClientRequestChan: make(chan *mmqueue.ClientRequest),
-		AssignmentsChan:   make(chan *pb.Roster),
-		OtelMeterPtr:      meterptr,
+		Cfg:                cfg,
+		Log:                log,
+		ClientRequestChan:  make(chan *mmqueue.ClientRequest),
+		AssignmentReceiver: receiver,
+		OtelMeterPtr:       meterptr,
 	}
 
 	//Check connection before spinning everything up.
@@ -206,5 +280,6 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Fatal(err)
 	}
+	receiverCleanup()
 	logger.Info("Exiting...")
 }

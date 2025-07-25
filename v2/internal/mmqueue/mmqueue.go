@@ -35,6 +35,7 @@ import (
 	//soloduelServer "open-match.dev/functions/golang/soloduel"
 	//mmf "open-match.dev/mmf/server"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
@@ -47,14 +48,15 @@ var (
 // requests, queueing them to be sent to Open Match, and processing them
 // asynchronously.
 type MatchmakerQueue struct {
-	OmClient          *omclient.RestfulOMGrpcClient
-	Cfg               *viper.Viper
-	Log               *logrus.Logger
-	Tickets           sync.Map
-	ClientRequestChan chan *ClientRequest
-	AssignmentsChan   chan *pb.Roster
-	OtelMeterPtr      *metric.Meter
-	TPC               int64
+	OmClient              *omclient.RestfulOMGrpcClient
+	Cfg                   *viper.Viper
+	Log                   *logrus.Logger
+	Tickets               sync.Map
+	ClientRequestChan     chan *ClientRequest
+	AssignmentDistributor assignmentdistributor.Receiver
+	AssignmentsChan       chan *pb.Roster
+	OtelMeterPtr          *metric.Meter
+	TPC                   int64
 }
 
 type ClientRequest struct {
@@ -192,17 +194,17 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		bLogger := q.Log.WithFields(logrus.Fields{
 			"operation": "ticket_assignment",
 		})
-		logger.Debug("processing incoming ticket assignments")
+		bLogger.Debug("processing incoming ticket assignments")
 
 		// Don't exit the Run() function as long as this goroutine is running.
 		wg.Add(1)
 		defer wg.Done()
 
-		assigned := make(map[string]bool) // TODO
-		var assignment string
-		for roster := range q.AssignmentsChan {
+		assigned := make(map[string]bool) // This map might need to be a sync.Map concurrent access if handler runs in parallel
+
+		assignmentHandler := func(ctx context.Context, roster *pb.Roster) {
 			// Get the assignment string
-			assignment = roster.GetAssignment().GetConnection()
+			assignment := roster.GetAssignment().GetConnection()
 
 			// Loop through all tickets in the assignment roster
 			var ticket *pb.Ticket
@@ -210,7 +212,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 				// TODO: in reality, this is where your matchmaking queue would
 				// return the assignment to the game client. This sample
 				// instead just logs the assignment.
-				//
+
 				// Stop tracking this ticket; it's matchmaking is complete.
 				// Your matchmaker may wish to instead keep this for a time (in
 				// case the game client should be allowed to ask for the same
@@ -237,7 +239,11 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 			}
 
 		}
-
+		bLogger.Log.Info("Starting assignment receiver")
+		err := q.AssignmentDistributor.Receive(ctx, handler)
+		if err != nil {
+			bLogger.Log.Fatalf("Failed to start assignment receiver, please check your assignment distributor config: %v", err)
+		}
 	}()
 
 	// Don't exit the Run() function as long as any of the goroutines are

@@ -48,8 +48,7 @@ type PubSubSubscriber struct {
 	log          *logrus.Logger
 }
 
-func NewPubSubSubscriber(client *pubsub.Client, subID string, log *logrus.Logger) *PubSubSubscriber {
-	sub := client.Subscription(subID)
+func NewPubSubSubscriber(sub *pubsub.Subscription, log *logrus.Logger) *PubSubSubscriber {
 	return &PubSubSubscriber{subscription: sub, log: log}
 }
 
