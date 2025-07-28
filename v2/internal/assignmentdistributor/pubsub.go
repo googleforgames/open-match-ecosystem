@@ -25,8 +25,12 @@
 package assignmentdistributor
 
 import (
-	"cloud.google.com/go/pubsub"
 	"context"
+	"fmt"
+	"time"
+
+	"cloud.google.com/go/pubsub"
+	"github.com/google/uuid"
 	"github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
@@ -150,19 +154,19 @@ func (r *PubSubSubscriber) Receive(ctx context.Context, handler func(ctx context
 
 // cleanup function for Pub/Sub
 func (r *PubSubSubscriber) Stop() {
-	r.log.Infof("Cleaning up assignment pubsub subscription %s...", sub.ID())
+	r.log.Infof("Cleaning up assignment pubsub subscription %s...", r.subscription.ID())
 
 	// Use a new, short-lived context to ensure cleanup runs.
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := sub.Delete(cleanupCtx); err != nil {
-		log.Errorf("Failed to delete subscription %s: %v", sub.ID(), err)
+	if err := r.subscription.Delete(cleanupCtx); err != nil {
+		r.log.Errorf("Failed to delete subscription %s: %v", r.subscription.ID(), err)
 	} else {
-		log.Infof("Successfully deleted subscription %s", sub.ID())
+		r.log.Infof("Successfully deleted subscription %s", r.subscription.ID())
 	}
 
 	// close the client connection
-	p.client.Close()
+	r.client.Close()
 
 }

@@ -15,6 +15,7 @@ package assignmentdistributor
 
 import (
 	"context"
+
 	"github.com/googleforgames/open-match2/v2/pkg/pb"
 )
 
@@ -55,4 +56,4 @@ func (r *ChannelReceiver) Receive(ctx context.Context, handler func(ctx context.
 }
 
 // For a channel, this is a no-op.
-func (r *ChannelReceiver) Stop() { }
+func (r *ChannelReceiver) Stop() {}

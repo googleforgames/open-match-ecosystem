@@ -142,7 +142,6 @@ func main() {
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 
 	// Initialize assignment distribution
-	var cleanup func()
 	var receiver assignmentdistributor.Receiver
 	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
 	case "pubsub":
@@ -158,18 +157,12 @@ func main() {
 			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
 			log,
 		)
-
-		// cleanup function for Pub/Sub
-		receiverCleanup = func() { receiver.Delete() }
 	case "channel":
 		fallthrough // default is 'channel'
 	default:
 		log.Info("Using Go channels for assignment distribution")
 		assignmentsChan := make(chan *pb.Roster)
 		receiver = assignmentdistributor.NewChannelReceiver(assignmentsChan)
-		receiverCleanup = func() {
-			log.Info("No longer monitoring assigment channel")
-		}
 	}
 
 	// Initialize the queue
@@ -244,6 +237,5 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Fatal(err)
 	}
-	receiverCleanup()
 	logger.Info("Exiting...")
 }

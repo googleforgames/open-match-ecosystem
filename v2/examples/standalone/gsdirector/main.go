@@ -37,6 +37,8 @@ import (
 
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
+	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	
 	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
@@ -108,8 +110,7 @@ func main() {
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 
 	// Initialize assignment distribution
-	var cleanup func()
-	var receiver assignmentdistributor.Receiver
+	var publisher assignmentdistributor.Sender
 	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
 	case "pubsub":
 		// NOTE: If using pubsub to send assignments from your director to your matchmaking queue,
@@ -143,10 +144,14 @@ func main() {
 		},
 		Cfg:                   cfg,
 		Log:                   log,
-		AssignmentDistributor: receiver,
+		AssignmentPublisher: publisher,
 		OtelMeterPtr:          meterptr,
 	}
-	err := d.GSManager.Init(gsdirector.FleetConfig)
+	err := d.GSManager.Init(
+		gsdirector.FleetConfig, 
+		gsdirector.ZonePools, 
+		gsdirector.GameModesInZone,
+	)
 	if err != nil {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}

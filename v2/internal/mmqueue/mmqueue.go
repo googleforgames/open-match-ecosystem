@@ -53,7 +53,7 @@ type MatchmakerQueue struct {
 	Log                   *logrus.Logger
 	Tickets               sync.Map
 	ClientRequestChan     chan *ClientRequest
-	AssignmentDistributor assignmentdistributor.Receiver
+	AssignmentReceiver assignmentdistributor.Receiver
 	AssignmentsChan       chan *pb.Roster
 	OtelMeterPtr          *metric.Meter
 	TPC                   int64
@@ -239,10 +239,10 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 			}
 
 		}
-		bLogger.Log.Info("Starting assignment receiver")
-		err := q.AssignmentDistributor.Receive(ctx, handler)
+		bLogger.Info("Starting assignment receiver")
+		err := q.AssignmentReceiver.Receive(ctx, assignmentHandler)
 		if err != nil {
-			bLogger.Log.Fatalf("Failed to start assignment receiver, please check your assignment distributor config: %v", err)
+			bLogger.Fatalf("Failed to start assignment receiver, please check your assignment distributor config: %v", err)
 		}
 	}()
 

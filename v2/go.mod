@@ -6,6 +6,7 @@ require (
 	agones.dev/agones v1.50.0
 	cloud.google.com/go/pubsub v1.49.0
 	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/google/uuid v1.6.0
 	github.com/googleforgames/open-match2/v2 v2.0.2
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.22.0
@@ -52,7 +53,6 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.6 // indirect
 	github.com/googleapis/gax-go/v2 v2.15.0 // indirect
 	github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc // indirect

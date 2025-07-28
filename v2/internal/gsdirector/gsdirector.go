@@ -30,6 +30,7 @@ import (
 
 	agonesv1 "agones.dev/agones/pkg/apis/agones/v1"
 	allocationv1 "agones.dev/agones/pkg/apis/allocation/v1"
+	backoff "github.com/cenkalti/backoff/v4"
 	"github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -1357,10 +1358,10 @@ func (d *MockDirector) Run(ctx context.Context) {
 					err = backoff.RetryNotify(
 						func() error {
 							// The call we want to retry with exponential backoff and jitter
-							err := d.AssignmentDistributor.Send(ctx, roster)
+							err := d.AssignmentPublisher.Send(ctx, roster)
 							return err
 						},
-						backoff.NewExponentialBackoff(backoff.WithMaxElapsedTime(5*time.Second)),
+						backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)),
 						func(err error, bo time.Duration) {
 							d.Log.Warnf("Sending match session assignment temporary failure (backoff for %v)r: %v", err, bo)
 						},
@@ -1386,7 +1387,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 						// allocation. In a production matchmaker, not taking
 						// action here to fix the problem would result in a
 						// leaked server allocation!
-						d.Log.Errorf("Leaked server allocation %v because the assignment couldn't be returned to the game clients!", connstring)
+						d.Log.Errorf("Leaked server allocation %v because the assignment couldn't be returned to the game clients!", connString)
 					}
 				}
 			}
