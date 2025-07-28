@@ -122,6 +122,9 @@ func main() {
 
 	// Assignment distribution config
 	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "channel")
+	// Only used if the ASSIGNMENT_DISTRIBUTION_PATH is set to 'pubsub'
+	cfg.SetDefault("GCP_PROJECT_ID", "replace_me")
+	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace_me")
 
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
@@ -143,66 +146,27 @@ func main() {
 	var receiver assignmentdistributor.Receiver
 	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
 	case "pubsub":
-		// NOTE: If using pubsub to send assignments from your director to your matchmaking queue,
-		// make sure you have sufficient quota for subscriptions in your GCP project. Each instance of the
-		// mmqueue will make a unique topic subscription.
+		// NOTE: If using pubsub to send assignments from your director to your
+		// matchmaking queue, make sure you have sufficient quota for
+		// subscriptions in your GCP project. Each instance of the mmqueue will
+		// make a unique topic subscription.
 		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
-		projectID := cfg.GetString("GCP_PROJECT_ID")
-		topicID := cfg.GetString("ASSIGNMENT_TOPIC_ID")
-
-		// Get Pub/Sub specific configuration
-		if projectID == "" || topicID == "" {
-			log.Fatalln("For 'pubsub' assignment distribution, GCP_PROJECT_ID and ASSIGNMENT_TOPIC_ID must be set")
-		}
-
-		// Create a Pub/Sub client
-		ctx := context.Background()
-		client, err := pubsub.NewClient(ctx, projectID)
-		if err != nil {
-			log.Fatalf("Failed to initialize pubsub client to receive assignments: %v", err)
-		}
-
-		// Unique subscription name for each application instance.
-		subID := fmt.Sprintf("mmqueue-%s-sub", uuid.NewString())
-		log.Infof("Creating subscription: %s", subID)
-		sub, err := client.CreateSubscription(ctx, subID, pubsub.SubscriptionConfig{
-			Topic:       topic,
-			AckDeadline: 20 * time.Second,
-			// The subscription will be automatically deleted by GCP after 24 hours
-			// of inactivity. This is a safeguard against orphaned resources if
-			// the app crashes without cleaning up.
-			ExpirationPolicy: 24 * time.Hour,
-		})
-		if err != nil {
-			log.Fatalf("Failed to create Pub/Sub subscription: %v", err)
-		}
 
 		// Instantiate the Pub/Sub receiver
-		receiver = distribution.NewPubSubReceiver(sub, log)
+		receiver = assignmentdistributor.NewPubSubSubscriber(
+			cfg.GetString("GCP_PROJECT_ID"),
+			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
+			log,
+		)
 
 		// cleanup function for Pub/Sub
-		receiverCleanup = func() {
-			log.Infof("Cleaning up assignment pubsub subscription %s...", sub.ID())
-
-			// Use a new, short-lived context to ensure cleanup runs.
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
-			if err := sub.Delete(cleanupCtx); err != nil {
-				log.Errorf("Failed to delete subscription %s: %v", sub.ID(), err)
-			} else {
-				log.Infof("Successfully deleted subscription %s", sub.ID())
-			}
-
-			// close the client connection.
-			client.Close()
-		}
+		receiverCleanup = func() { receiver.Delete() }
 	case "channel":
 		fallthrough // default is 'channel'
 	default:
 		log.Info("Using Go channels for assignment distribution")
 		assignmentsChan := make(chan *pb.Roster)
-		receiver = distribution.NewChannelReceiver(assignmentsChan)
+		receiver = assignmentdistributor.NewChannelReceiver(assignmentsChan)
 		receiverCleanup = func() {
 			log.Info("No longer monitoring assigment channel")
 		}

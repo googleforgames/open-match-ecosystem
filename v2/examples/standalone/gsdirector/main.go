@@ -37,6 +37,7 @@ import (
 
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
+	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
@@ -83,6 +84,12 @@ func main() {
 	cfg.SetDefault("OTEL_SIDECAR", "true")
 	cfg.SetDefault("OTEL_PROM_PORT", 2225)
 
+	// Assignment distribution config
+	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "channel")
+	// Only used if the ASSIGNMENT_DISTRIBUTION_PATH is set to 'pubsub'
+	cfg.SetDefault("GCP_PROJECT_ID", "replace_me")
+	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace_me")
+
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
 
@@ -100,6 +107,30 @@ func main() {
 	}
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 
+	// Initialize assignment distribution
+	var cleanup func()
+	var receiver assignmentdistributor.Receiver
+	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
+	case "pubsub":
+		// NOTE: If using pubsub to send assignments from your director to your matchmaking queue,
+		// make sure you have sufficient quota for subscriptions in your GCP project. Each instance of the
+		// mmqueue will make a unique topic subscription.
+		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
+
+		// Instantiate the Pub/Sub receiver
+		publisher = assignmentdistributor.NewPubSubPublisher(
+			cfg.GetString("GCP_PROJECT_ID"),
+			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
+			log,
+		)
+	case "channel":
+		fallthrough // default is 'channel'
+	default:
+		log.Info("Using Go channels for assignment distribution")
+		assignmentsChan := make(chan *pb.Roster)
+		publisher = assignmentdistributor.NewChannelSender(assignmentsChan)
+	}
+
 	// Initialize the director
 	d := &gsdirector.MockDirector{
 		OmClient: &omclient.RestfulOMGrpcClient{
@@ -110,9 +141,10 @@ func main() {
 		GSManager: &gsdirector.MockAgonesIntegration{
 			Log: log,
 		},
-		Cfg:          cfg,
-		Log:          log,
-		OtelMeterPtr: meterptr,
+		Cfg:                   cfg,
+		Log:                   log,
+		AssignmentDistributor: receiver,
+		OtelMeterPtr:          meterptr,
 	}
 	err := d.GSManager.Init(gsdirector.FleetConfig)
 	if err != nil {
