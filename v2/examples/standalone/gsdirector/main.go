@@ -38,7 +38,7 @@ import (
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
-	
+
 	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
@@ -147,11 +147,10 @@ func main() {
 		AssignmentPublisher: publisher,
 		OtelMeterPtr:          meterptr,
 	}
-	err := d.GSManager.Init(
-		gsdirector.FleetConfig, 
-		gsdirector.ZonePools, 
-		gsdirector.GameModesInZone,
-	)
+	// In a real stand-alone director, you would read in your actual game server configuration and construct
+	// the FleetConfig, ZonePools, and GameModesInZone. For automated testing, we use the sample ones
+	// defined in the internal/gsdirector module.
+	err := d.GSManager.Init(gsdirector.FleetConfig, gsdirector.ZonePools, gsdirector.GameModesInZone)
 	if err != nil {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}
