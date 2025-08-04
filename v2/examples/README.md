@@ -22,6 +22,7 @@ The system is primarily composed of three applications found in the examples/ di
 * **omclient**: A RESTful HTTP client for communicating with the om-core service's gRPC-gateway endpoints. It handles ticket creation, activation, and invoking matchmaking functions.  
 * **mmqueue**: The module containing the core logic for the matchmaking queue, including managing client requests and processing assignments via Go channels. It can be run as part of the monolithic matchmaker or as the standalone mmqueue service.  
 * **gsdirector**: Contains the logic for the game server director. This module includes a MockAgonesIntegration which simulates a game server manager by providing matchmaking requirements (e.g., game modes available in specific regions) and handling mock server allocations.  
+* **assignmentdistributor**: An interface the samples use to return assignments from the game server director to the matchmaking queue, and two implementations (one using Google Cloud Pub/Sub, and one using golang channels for local development).
 * **metrics & logging**: Centralized modules for initializing OpenTelemetry metrics and structured Logrus logging, respectively, used by all applications.  
 * **extensions**: Provides utility functions for working with the google.protobuf.Any type used extensively in Open Match protobuf messages.  
 * **mocks/gameclient**: A utility to generate mock Ticket objects, simulating requests from game clients for testing purposes.

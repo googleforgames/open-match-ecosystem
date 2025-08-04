@@ -121,8 +121,12 @@ func main() {
 	cfg.SetDefault("OTEL_PROM_PORT", 2224)
 
 	// Assignment distribution config
-	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "channel")
-	// Only used if the ASSIGNMENT_DISTRIBUTION_PATH is set to 'pubsub'
+	// Returning assignments via channel only works if the mmqueue and the
+	// gsdirector are running in the same process, so you'll need to provide a
+	// different assignment return data flow.  We sugest using a distributed
+	// message bus, pub/sub system, or your platform service's notification
+	// service when returning assignments.
+	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "pubsub")
 	cfg.SetDefault("GCP_PROJECT_ID", "replace_me")
 	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace_me")
 
@@ -144,8 +148,12 @@ func main() {
 	// Initialize assignment distribution
 	var receiver assignmentdistributor.Receiver
 	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
+	case "channel":
+		log.Fatal("Using Go channels for assignment distribution isn't possible unless the matchmaking queue and game server director are running in the same process, which should only be done when doing active local development.")
 	case "pubsub":
-		// NOTE: If using pubsub to send assignments from your director to your
+		fallthrough // default is 'pubsub' in the standalone mmqueue
+	default:
+		// note: if using pubsub to send assignments from your director to your
 		// matchmaking queue, make sure you have sufficient quota for
 		// subscriptions in your GCP project. Each instance of the mmqueue will
 		// make a unique topic subscription.
@@ -157,12 +165,6 @@ func main() {
 			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
 			log,
 		)
-	case "channel":
-		fallthrough // default is 'channel'
-	default:
-		log.Info("Using Go channels for assignment distribution")
-		assignmentsChan := make(chan *pb.Roster)
-		receiver = assignmentdistributor.NewChannelReceiver(assignmentsChan)
 	}
 
 	// Initialize the queue
@@ -234,6 +236,7 @@ func main() {
 
 	// Wait for quit signal
 	<-signalChan
+	receiver.Stop()
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Fatal(err)
 	}

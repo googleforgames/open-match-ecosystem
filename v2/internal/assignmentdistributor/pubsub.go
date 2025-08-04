@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// The Pub/Sub assignment distributor sends assignments to the mmqueue using
-// Google Cloud Pub/Sub.  This is a basic sample of how to use a distributed
-// messaging service to deliver assignments from your matchmaker 'director'
-// (the component that allocates servers), and the matchmaker 'queue' (the
-// component that connects to the game client). It is not tested at production
-// scale and should be thoroughly hardened before use in production.
+// The Pub/Sub assignment distributor returns assignments using Google Cloud
+// Pub/Sub.  This is a basic sample of how to use a distributed messaging
+// service to deliver assignments from your matchmaker 'director' (the
+// component that allocates servers), and the matchmaker 'queue' (the component
+// that connects to the game client). It is not tested at production scale and
+// should be thoroughly hardened before use in production.
 //
 // It does not create or delete topics for the publisher (It assumes the topic
 // ID you send to it has already been created.), but it does create and delete
@@ -49,7 +49,7 @@ func NewPubSubPublisher(projectID string, topicID string, log *logrus.Logger) *P
 
 	// Get Pub/Sub specific configuration
 	if projectID == "" || topicID == "" {
-		log.Fatalln("For 'pubsub' assignment distribution, GCP_PROJECT_ID and ASSIGNMENT_TOPIC_ID must be set")
+		log.Fatalln("For 'pubsub' assignment distribution, Google Cloud Project ID and an existing Topic ID to use must be provided")
 	}
 
 	// Create a Pub/Sub client
@@ -104,7 +104,7 @@ type PubSubSubscriber struct {
 func NewPubSubSubscriber(projectID string, topicID string, log *logrus.Logger) *PubSubSubscriber {
 	// Get Pub/Sub specific configuration
 	if projectID == "" || topicID == "" {
-		log.Fatalln("For 'pubsub' assignment distribution, GCP_PROJECT_ID and ASSIGNMENT_TOPIC_ID must be set")
+		log.Fatalln("For 'pubsub' assignment distribution, Google Cloud Project ID and an existing Topic ID to use must be provided")
 	}
 
 	// Create a Pub/Sub client
