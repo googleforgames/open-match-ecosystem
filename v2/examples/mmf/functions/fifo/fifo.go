@@ -74,7 +74,7 @@ var (
 
 // Use the golang programming pattern of a private struct, forcing someone using
 // this module to use New() or NewWithLogger() to instantiate the object. Doing
-// it this way lets us set have an overridable, default logger.
+// it this way lets us have an overridable, default logger.
 
 // Private struct
 type mmfServer struct {
@@ -100,7 +100,8 @@ func NewWithLogger(l *logrus.Logger) *mmfServer {
 }
 
 // Run is this match function's implementation of the gRPC call defined in
-// proto/v2/mmf.proto. This is the function you will want to customize.
+// the OM2 repo proto/v2/mmf.proto file. This is the function you will want to
+// customize.
 func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 
 	startTime := time.Now()
