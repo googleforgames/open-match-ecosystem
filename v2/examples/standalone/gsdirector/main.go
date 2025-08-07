@@ -37,6 +37,7 @@ import (
 
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
+	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
@@ -63,7 +64,6 @@ func main() {
 
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
-	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
 	cfg.SetDefault("PORT", "8090")
 
 	// OM core config that the matchmaker needs to respect
@@ -122,7 +122,10 @@ func main() {
 	var publisher assignmentdistributor.Sender
 	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
 	case "channel":
-		log.Fatal("Using Go channels for assignment distribution isn't possible unless the matchmaking queue and game server director are running in the same process, which should only be done when doing active local development.")
+		log.Info("Using Go channels for assignment distribution")
+		log.Error("Using Go channels for assignment distribution isn't possible unless the matchmaking queue and game server director are running in the same process, which should only be done when doing active local development. Since this is a standalone game server director process, the go channel will never be read, so assignments are effectively discarded with this configuration.")
+		assignmentsChan := make(chan *pb.Roster)
+		publisher = assignmentdistributor.NewChannelSender(assignmentsChan)
 	case "pubsub":
 		fallthrough // default is 'pubsub' in the standalone mmqueue
 	default:

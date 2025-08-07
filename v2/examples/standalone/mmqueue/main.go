@@ -149,7 +149,10 @@ func main() {
 	var receiver assignmentdistributor.Receiver
 	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
 	case "channel":
-		log.Fatal("Using Go channels for assignment distribution isn't possible unless the matchmaking queue and game server director are running in the same process, which should only be done when doing active local development.")
+		log.Info("Using Go channels for assignment distribution")
+		log.Error("Using Go channels for assignment distribution isn't possible unless the matchmaking queue and game server director are running in the same process, which should only be done when doing active local development. Since this is a standalone matchmaking queue process, there is no game server director sending data on the go channel - assignments are effectively discarded with this configuration.")
+		assignmentsChan := make(chan *pb.Roster)
+		receiver = assignmentdistributor.NewChannelReceiver(assignmentsChan)
 	case "pubsub":
 		fallthrough // default is 'pubsub' in the standalone mmqueue
 	default:
