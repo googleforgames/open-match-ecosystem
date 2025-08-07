@@ -48,15 +48,15 @@ var (
 // requests, queueing them to be sent to Open Match, and processing them
 // asynchronously.
 type MatchmakerQueue struct {
-	OmClient              *omclient.RestfulOMGrpcClient
-	Cfg                   *viper.Viper
-	Log                   *logrus.Logger
-	Tickets               sync.Map
-	ClientRequestChan     chan *ClientRequest
+	OmClient           *omclient.RestfulOMGrpcClient
+	Cfg                *viper.Viper
+	Log                *logrus.Logger
+	Tickets            sync.Map
+	ClientRequestChan  chan *ClientRequest
 	AssignmentReceiver assignmentdistributor.Receiver
-	AssignmentsChan       chan *pb.Roster
-	OtelMeterPtr          *metric.Meter
-	TPC                   int64
+	AssignmentsChan    chan *pb.Roster
+	OtelMeterPtr       *metric.Meter
+	TPC                int64
 }
 
 type ClientRequest struct {

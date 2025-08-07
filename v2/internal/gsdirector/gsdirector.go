@@ -72,18 +72,15 @@ var (
 	// Pool with a set of filters to get tickets where the player selected a
 	// tank class
 	Tanks = &pb.Pool{Name: "tank",
-		StringEqualsFilters: []*pb.Pool_StringEqualsFilter{
-			&pb.Pool_StringEqualsFilter{StringArg: "class", Value: "tank"}}}
+		StringEqualsFilters: []*pb.Pool_StringEqualsFilter{{StringArg: "class", Value: "tank"}}}
 
 	// Pool with a set of filters to get where the player selected a dps class
 	DPS = &pb.Pool{Name: "dps",
-		StringEqualsFilters: []*pb.Pool_StringEqualsFilter{
-			&pb.Pool_StringEqualsFilter{StringArg: "class", Value: "dps"}}}
+		StringEqualsFilters: []*pb.Pool_StringEqualsFilter{{StringArg: "class", Value: "dps"}}}
 
 	// Pool with a set of filters to get where the player selected a healer class
 	Healers = &pb.Pool{Name: "healer",
-		StringEqualsFilters: []*pb.Pool_StringEqualsFilter{
-			&pb.Pool_StringEqualsFilter{StringArg: "class", Value: "healer"}}}
+		StringEqualsFilters: []*pb.Pool_StringEqualsFilter{{StringArg: "class", Value: "healer"}}}
 
 	// Matchmaking function specifications
 	Fifo = &pb.MatchmakingFunctionSpec{
@@ -154,7 +151,7 @@ var (
 	// infrastructure, and instantiate the GSDirector struct using that custom
 	// GameModesInZone map.
 	GameModesInZone = map[string][]*GameMode{
-		"asia-northeast1-a": []*GameMode{SoloDuel},
+		"asia-northeast1-a": {SoloDuel},
 	}
 
 	// Map of filter sets (held in pb.Pool structs, for easy combination) to
@@ -167,9 +164,9 @@ var (
 	// that works for your infrastructure, and instantiate the GSDirector struct
 	// using that custom ZonePools map.
 	ZonePools = map[string]*pb.Pool{
-		"asia-northeast1-a": &pb.Pool{
+		"asia-northeast1-a": {
 			DoubleRangeFilters: []*pb.Pool_DoubleRangeFilter{
-				&pb.Pool_DoubleRangeFilter{
+				{
 					DoubleArg: "ping.asia-northeast1-a",
 					Minimum:   1,
 					Maximum:   120,
@@ -178,16 +175,16 @@ var (
 		},
 		// All other zones aren't used currently and are included for
 		// instructional purposes.
-		"asia-northeast3-b":      &pb.Pool{},
-		"asia-south2-c":          &pb.Pool{},
-		"australia-southeast1-c": &pb.Pool{},
-		"europe-central2-b":      &pb.Pool{},
-		"europe-west3-a":         &pb.Pool{},
-		"me-central2-a":          &pb.Pool{},
-		"us-east4-b":             &pb.Pool{},
-		"us-west2-c":             &pb.Pool{},
-		"southamerica-east1-c":   &pb.Pool{},
-		"africa-south1-b":        &pb.Pool{},
+		"asia-northeast3-b":      {},
+		"asia-south2-c":          {},
+		"australia-southeast1-c": {},
+		"europe-central2-b":      {},
+		"europe-west3-a":         {},
+		"me-central2-a":          {},
+		"us-east4-b":             {},
+		"us-west2-c":             {},
+		"southamerica-east1-c":   {},
+		"africa-south1-b":        {},
 	}
 
 	// Nested map structure defining which game modes are available in which
@@ -199,25 +196,25 @@ var (
 	// that works for your infrastructure, and instantiate the GSDirector struct
 	// using that custom FleetConfig.
 	FleetConfig = map[string]map[string]string{
-		"APAC": map[string]string{
+		"APAC": {
 			"JP_Tokyo":  "asia-northeast1-a",
 			"KR_Seoul":  "asia-northeast3-b",
 			"IN_Delhi":  "asia-south2-c",
 			"AU_Sydney": "australia-southeast1-c",
 		},
-		"EMEA": map[string]string{
+		"EMEA": {
 			"PL_Warsaw":    "europe-central2-b",
 			"DE_Frankfurt": "europe-west3-a",
 			"SA_Dammam":    "me-central2-a",
 		},
-		"NA": map[string]string{
+		"NA": {
 			"US_Ashburn":    "us-east4-b",
 			"US_LosAngeles": "us-west2-c",
 		},
-		"SA": map[string]string{
+		"SA": {
 			"BR_SaoPaulo": "southamerica-east1-c",
 		},
-		"Africa": map[string]string{
+		"Africa": {
 			"ZA_Johannesburg": "africa-south1-b",
 		},
 	}
@@ -434,7 +431,6 @@ func allocationSpecFromMMFRequests(mmfParams []*pb.MmfRequest, logger *logrus.Lo
 		mpa.mmfParams = append(mpa.mmfParams, string(mmfParamJSON[:]))
 	}
 
-	//r := &T{MmfReqs: []string{string(reqBytes[:]), string(reqBytes[:])}}
 	// Convert the mmfParams to JSON, and get a hash of that JSON
 	mmfParamsAnnotationJSON, err := json.Marshal(mpa.mmfParams)
 	if err != nil {
@@ -448,7 +444,7 @@ func allocationSpecFromMMFRequests(mmfParams []*pb.MmfRequest, logger *logrus.Lo
 	// as an annotation to the game server upon allocation.
 	return &allocationv1.GameServerAllocationSpec{
 		Selectors: []allocationv1.GameServerSelector{
-			allocationv1.GameServerSelector{
+			{
 				LabelSelector: metav1.LabelSelector{
 					// TODO: move to lists, and have one hash for every mmfRequest
 					// https://github.com/googleforgames/agones/issues/4003
@@ -580,23 +576,38 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 
 	m.Log.Debug("Initializing matching parameters")
 
-	// appendPoolFilters copies the filters from src pool to dest pool, allowing us
-	// to combine filters from different pools to create pools dynamically.
+	// appendPoolParams copies the filters and extensions from src pool to dest
+	// pool, allowing us to combine different pools to create pools
+	// dynamically.
 	//
 	// NOTE: If the destination contains a CreationTimeFilter and the source does
 	// not, the destination CreationTimeFilter will be preserved.
-	appendPoolFilters := func(dest *pb.Pool, src *pb.Pool) *pb.Pool {
-		dest.TagPresentFilters = append(dest.TagPresentFilters, src.GetTagPresentFilters()...)
-		dest.DoubleRangeFilters = append(dest.DoubleRangeFilters, src.GetDoubleRangeFilters()...)
-		dest.StringEqualsFilters = append(dest.StringEqualsFilters, src.GetStringEqualsFilters()...)
+	// NOTE: If the destination and source both have an extension with the same key,
+	// the value from the src extension will take precedence.
+	appendPoolParams := func(dest *pb.Pool, src *pb.Pool) (result *pb.Pool) {
+		result = &pb.Pool{}
+		result.TagPresentFilters = append(dest.TagPresentFilters, src.GetTagPresentFilters()...)
+		result.DoubleRangeFilters = append(dest.DoubleRangeFilters, src.GetDoubleRangeFilters()...)
+		result.StringEqualsFilters = append(dest.StringEqualsFilters, src.GetStringEqualsFilters()...)
 
 		// Check that the source has a creation time filter before copying to avoid
 		// an empty src filter overwriting an existing dest filter. This can only
 		// happen with this type of filter, as all others are contained in arrays.
+		result.CreationTimeRangeFilter = dest.GetCreationTimeRangeFilter()
 		if src.GetCreationTimeRangeFilter() != nil {
-			dest.CreationTimeRangeFilter = src.GetCreationTimeRangeFilter()
+			result.CreationTimeRangeFilter = src.GetCreationTimeRangeFilter()
 		}
-		return dest
+
+		// Combine extensions
+		result.Extensions = dest.Extensions
+		if result.Extensions == nil {
+			result.Extensions = map[string]*anypb.Any{}
+		}
+		for key, value := range src.Extensions {
+			result.Extensions[key] = value
+		}
+
+		return result
 	}
 
 	// In-memory game server state tracking maps init
@@ -643,7 +654,7 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 				mpa := &mmfParametersAnnotation{mmfParams: make([]string, 0)} // String version to attach to k8s metadata
 				mGSSet.server.mmfParams = make([]*pb.MmfRequest, 0)           // protobuf version to send to Open Match.
 
-				// retrieve filters for this specific datacenter.
+				// retrieve filters & extensions for this specific datacenter.
 				zonePool, exists := zonePools[zone]
 				if !exists {
 					zonePool = &pb.Pool{}
@@ -665,17 +676,16 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 						time.Now().UnixNano(),
 					)
 
-					// Generate sets of filters (held in pb.Pool structures) that define the kinds of
-					// tickets this game mode in this zone wants to use for matching.
+					// Dynamically combine sets of filters and extensions that
+					// define the kinds of tickets this game mode in this zone
+					// wants to use for matching.
 					composedPools := map[string]*pb.Pool{}
 					for pname, thisModePool := range mode.Pools {
+						// Combine the pool parameters defined for this game
+						// mode, and for this server zone.
+						composedPool := appendPoolParams(thisModePool, zonePool)
 						composedName := fmt.Sprintf("%v.%v", fleetName, pname)
-						// Make a new pool with a name combining the fleet and the game mode's pool name
-						composedPool := &pb.Pool{Name: composedName}
-
-						// Add filters to this pool
-						composedPool = appendPoolFilters(composedPool, zonePool)
-						appendPoolFilters(composedPool, thisModePool)
+						composedPool.Name = composedName
 						composedPools[composedName] = composedPool
 					}
 
@@ -714,7 +724,7 @@ func (m *MockAgonesIntegration) Init(fleetConfig map[string]map[string]string, z
 				// Generate an Agones Game Server Allocation that can allocate a ready server from this fleet.
 				mGSSet.server.allocSpec = &allocationv1.GameServerAllocationSpec{
 					Selectors: []allocationv1.GameServerSelector{
-						allocationv1.GameServerSelector{
+						{
 							LabelSelector: metav1.LabelSelector{
 								// TODO: move to lists, and have one hash for every mmfRequest
 								// https://github.com/googleforgames/agones/issues/4003
@@ -790,12 +800,12 @@ func (m *MockAgonesIntegration) Allocate(allocationSpecJSON string, match *pb.Ma
 	// object from kubernetes/the Agones SDK.  Here we generate a mock one instead.
 	mockGameServerStatus := &agonesv1.GameServerStatus{
 		Ports: []agonesv1.GameServerStatusPort{
-			agonesv1.GameServerStatusPort{
+			{
 				Name: "default",
-				Port: 7463},
+				Port: 7463,
+			},
 		},
-		Address:  "1.2.3.4",
-		NodeName: "node-name",
+		Address: "1.2.3.4",
 	}
 
 	// Make the assignment connection string out of the data received from Agones.

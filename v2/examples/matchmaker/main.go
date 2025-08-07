@@ -19,6 +19,11 @@
 // locally, and look at the examples in the 'standalone' directory when you're
 // ready to run the components separately in production (because you'll very
 // likely want to scale your mmqueue processes horizontally).
+//
+// Here's a typical command line for running a copy of this file locally for
+// development:
+//
+// LOGGING_FORMAT=text LOGGING_LEVEL=debug OTEL_SIDECAR=false go run .
 package main
 
 import (
@@ -42,9 +47,10 @@ import (
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
 	"google.golang.org/protobuf/types/known/anypb"
-	_ "google.golang.org/protobuf/types/known/wrapperspb"
+	knownpb "google.golang.org/protobuf/types/known/wrapperspb"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/debug"
 	"open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/fifo"
 	mmfserver "open-match.dev/open-match-ecosystem/v2/examples/mmf/server"
 	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
@@ -68,15 +74,30 @@ var (
 
 	// configuration that requires recompilation
 	mockClientTicket = gameclient.Simple
-	mmfFifo          = &pb.MatchmakingFunctionSpec{
+	mmfDebug         = &pb.MatchmakingFunctionSpec{
+		Name: "DEBUG",
+		Type: pb.MatchmakingFunctionSpec_GRPC,
+	}
+	mmfFifo = &pb.MatchmakingFunctionSpec{
 		Name: "FIFO",
 		Type: pb.MatchmakingFunctionSpec_GRPC,
 	}
+
+	// Simple test extension to put into pools, so we can make sure it is
+	// properly propogated to the MMF.
+	testEx, _       = anypb.New(&knownpb.StringValue{Value: "testValue"})
+	everyTicketPool = &pb.Pool{
+		Name:                    gsdirector.EveryTicket.GetName(),
+		CreationTimeRangeFilter: gsdirector.EveryTicket.GetCreationTimeRangeFilter(),
+		Extensions:              map[string]*anypb.Any{"testKey": testEx},
+	}
+
+	// The MMF request this type of game should use if the match is not filled.
 	backfillMMFs, _ = anypb.New(&pb.MmfRequest{Mmfs: []*pb.MatchmakingFunctionSpec{mmfFifo}})
 	soloduel        = &gsdirector.GameMode{
 		Name:  "SoloDuel",
-		MMFs:  []*pb.MatchmakingFunctionSpec{mmfFifo},
-		Pools: map[string]*pb.Pool{"all": gsdirector.EveryTicket},
+		MMFs:  []*pb.MatchmakingFunctionSpec{mmfDebug},
+		Pools: map[string]*pb.Pool{"all": everyTicketPool},
 		ExtensionParams: extensions.Combine(extensions.AnypbIntMap(map[string]int32{
 			"desiredNumRosters": 1,
 			"desiredRosterLen":  4,
@@ -142,6 +163,8 @@ func main() {
 	// MMF config
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
 	cfg.SetDefault("SOLODUEL_PORT", 50080)
+	cfg.SetDefault("DEBUGMMF_ADDR", "http://localhost")
+	cfg.SetDefault("DEBUGMMF_PORT", 50081)
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -160,18 +183,18 @@ func main() {
 	// your platform service's notification service to return assignments
 	// instead.
 
-	// Set this duration to slightly longer than your configured
-	// OM_CACHE_TICKET_TTL_MS and OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS config
-	// vars in om-core, added together. If you haven't manually set those
-	// config vars, you can see the default values in the om-core repository's
-	// 'internal/config/config.go' file.
+	// When using the deprecated om-core assignment endpoints, set this
+	// duration to slightly longer than your configured OM_CACHE_TICKET_TTL_MS
+	// and OM_CACHE_ASSIGNMENT_ADDITIONAL_TTL_MS config vars in om-core, added
+	// together. If you haven't manually set those config vars, you can see the
+	// default values in the om-core repository's 'internal/config/config.go'
+	// file.
 	cfg.SetDefault("ASSIGNMENT_TTL_MS", 1200000) // default 1200 secs = 10 mins
 
-	// Assignment distribution config uses golang channels for this
+	// Assignment distribution default config uses golang channels for this
 	// 'all-in-one' matchmaker, where the mmqueue and gsdirector are in the
-	// same process.
-	// Example trivial 'pubsub' implementation is also in this file, see switch
-	// statement below.
+	// same process.  Example trivial 'pubsub' implementation is also in this
+	// file, see switch statement later in this file.
 	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "channel")
 
 	// Only used if the ASSIGNMENT_DISTRIBUTION_PATH is set to 'pubsub'
@@ -261,9 +284,13 @@ func main() {
 		OtelMeterPtr:        meterptr,
 	}
 
-	// Configure the mmf server
+	// Configure the mmf servers. The Game Server Manager initialization
+	// process reads these values from the gameModesInZone map, so they need to
+	// be correctly populated before initializing the GSManager.
 	mmfFifo.Host = cfg.GetString("SOLODUEL_ADDR")
 	mmfFifo.Port = cfg.GetInt32("SOLODUEL_PORT")
+	mmfDebug.Host = cfg.GetString("DEBUGMMF_ADDR")
+	mmfDebug.Port = cfg.GetInt32("DEBUGMMF_PORT")
 
 	// Initialize the game server manager used by the director
 	err := d.GSManager.Init(fleetConfig, zonePools, gameModesInZone)
@@ -272,11 +299,15 @@ func main() {
 	}
 
 	// FOR TESTING ONLY
-	// Run an in-process local mmf server. This approach will NOT scale to production workloads
+	// Run in-process local mmf server(s). This approach will NOT scale to production workloads
 	// and should only be used for local development and testing your matching logic.
 	if cfg.GetString("SOLODUEL_ADDR") == "http://localhost" {
 		localTestMMF := fifo.NewWithLogger(log)
 		go mmfserver.StartServer(cfg.GetInt32("SOLODUEL_PORT"), localTestMMF, log)
+	}
+	if cfg.GetString("DEBUGMMF_ADDR") == "http://localhost" {
+		localDebugMMF := debug.NewWithLogger(log)
+		go mmfserver.StartServer(cfg.GetInt32("DEBUGMMF_PORT"), localDebugMMF, log)
 	}
 
 	//Check connection before spinning up the matchmaking queue

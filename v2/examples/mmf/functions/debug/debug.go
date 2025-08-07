@@ -102,22 +102,22 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	}
 
 	// Print the name of the profile.
-	s.logger.Infof("Profile      | %v ", req.GetName())
+	s.logger.Infof("Profile       | %v ", req.GetName())
 
 	// Print custom parameters.
 	printExtensions := func(exMap map[string]*anypb.Any, logger *logrus.Entry) {
 		for exKey := range exMap {
 			// Try it as an int32
 			if exValue, err := extensions.Int32(exMap, exKey); err == nil {
-				logger.Infof(" +Extensions | %v = %v", exKey, exValue)
+				logger.Infof("  +Extensions |  %v = %v", exKey, exValue)
 			}
 			// Try it as a bool
 			if exValue, err := extensions.Bool(exMap, exKey); err == nil {
-				logger.Infof(" +Extensions | %v = %v", exKey, exValue)
+				logger.Infof("  +Extensions |  %v = %v", exKey, exValue)
 			}
 			// Try it as a string
 			if exValue, err := extensions.String(exMap, exKey); err == nil {
-				logger.Infof(" +Extensions | %v = %v", exKey, exValue)
+				logger.Infof("  +Extensions |  %v = %v", exKey, exValue)
 			}
 			// Including and then printing other data types as extensions are
 			// possible, but you will need to write the code to cast the
@@ -132,20 +132,20 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	// Print debug info for the pools specified in the Match Profile.
 	for pname, pool := range req.GetPools() {
 		// Name of pool & number of matching tickets
-		s.logger.Infof(" Pools       | %v contains %v tickets ", pname, len(pool.GetParticipants().GetTickets()))
+		s.logger.Infof(" -Pool        | %v contains %v tickets ", pname, len(pool.GetParticipants().GetTickets()))
 
 		// Pool filters
 		if crTimeFilter := pool.GetCreationTimeRangeFilter(); crTimeFilter != nil {
-			s.logger.Infof(" +Filter     | CreationTimeRange %v - %v", crTimeFilter.GetStart(), crTimeFilter.GetEnd())
+			s.logger.Infof("  +Filter     |  CreationTimeRange %v - %v", crTimeFilter.GetStart(), crTimeFilter.GetEnd())
 		}
 		for _, filter := range pool.GetDoubleRangeFilters() {
-			s.logger.Infof(" +Filter     | Double at key %v within range %v - %v", filter.GetDoubleArg(), filter.GetMinimum(), filter.GetMaximum())
+			s.logger.Infof("  +Filter     |  Double at key %v within range %v - %v", filter.GetDoubleArg(), filter.GetMinimum(), filter.GetMaximum())
 		}
 		for _, filter := range pool.GetStringEqualsFilters() {
-			s.logger.Infof(" +Filter     | String at key %v = %v", filter.GetStringArg(), filter.GetValue())
+			s.logger.Infof("  +Filter     |  String at key %v = %v", filter.GetStringArg(), filter.GetValue())
 		}
 		for _, filter := range pool.GetTagPresentFilters() {
-			s.logger.Infof(" +Filter     | Tag %v exists", filter.GetTag())
+			s.logger.Infof(" +Filter     |  Tag %v exists", filter.GetTag())
 		}
 
 		// Print the extensions in the pool.
