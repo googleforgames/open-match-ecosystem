@@ -94,9 +94,10 @@ var (
 
 	// The MMF request this type of game should use if the match is not filled.
 	backfillMMFs, _ = anypb.New(&pb.MmfRequest{Mmfs: []*pb.MatchmakingFunctionSpec{mmfFifo}})
-	soloduel        = &gsdirector.GameMode{
+	// Define the parameters for a 'solo duel' (ffa) game mode.
+	soloduel = &gsdirector.GameMode{
 		Name:  "SoloDuel",
-		MMFs:  []*pb.MatchmakingFunctionSpec{mmfDebug},
+		MMFs:  []*pb.MatchmakingFunctionSpec{mmfFifo, mmfDebug},
 		Pools: map[string]*pb.Pool{"all": everyTicketPool},
 		ExtensionParams: extensions.Combine(extensions.AnypbIntMap(map[string]int32{
 			"desiredNumRosters": 1,
@@ -106,8 +107,10 @@ var (
 			extensions.MMFRequestKey: backfillMMFs,
 		}),
 	}
+	// Define which zones this game mode should be available in.
 	gameModesInZone = map[string][]*gsdirector.GameMode{"asia-northeast1-a": {soloduel}}
-	zonePools       = map[string]*pb.Pool{
+	// Determine what criteria a ticket should have to be considered a good 'match' for each available zone.
+	zonePools = map[string]*pb.Pool{
 		"asia-northeast1-a": {
 			DoubleRangeFilters: []*pb.Pool_DoubleRangeFilter{
 				{
@@ -118,6 +121,7 @@ var (
 			},
 		},
 	}
+	// Define which zones are considered to be in which city/country and region.
 	fleetConfig = map[string]map[string]string{
 		"APAC": {
 			"JP_Tokyo": "asia-northeast1-a",
@@ -284,23 +288,13 @@ func main() {
 		OtelMeterPtr:        meterptr,
 	}
 
-	// Configure the mmf servers. The Game Server Manager initialization
-	// process reads these values from the gameModesInZone map, so they need to
-	// be correctly populated before initializing the GSManager.
+	// FOR TESTING ONLY
+	// Run in-process local mmf server(s). This approach will NOT scale to production workloads
+	// and should only be used for local development and testing your matching logic.
 	mmfFifo.Host = cfg.GetString("SOLODUEL_ADDR")
 	mmfFifo.Port = cfg.GetInt32("SOLODUEL_PORT")
 	mmfDebug.Host = cfg.GetString("DEBUGMMF_ADDR")
 	mmfDebug.Port = cfg.GetInt32("DEBUGMMF_PORT")
-
-	// Initialize the game server manager used by the director
-	err := d.GSManager.Init(fleetConfig, zonePools, gameModesInZone)
-	if err != nil {
-		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
-	}
-
-	// FOR TESTING ONLY
-	// Run in-process local mmf server(s). This approach will NOT scale to production workloads
-	// and should only be used for local development and testing your matching logic.
 	if cfg.GetString("SOLODUEL_ADDR") == "http://localhost" {
 		localTestMMF := fifo.NewWithLogger(log)
 		go mmfserver.StartServer(cfg.GetInt32("SOLODUEL_PORT"), localTestMMF, log)
@@ -308,6 +302,12 @@ func main() {
 	if cfg.GetString("DEBUGMMF_ADDR") == "http://localhost" {
 		localDebugMMF := debug.NewWithLogger(log)
 		go mmfserver.StartServer(cfg.GetInt32("DEBUGMMF_PORT"), localDebugMMF, log)
+	}
+
+	// Initialize the game server manager used by the director
+	err := d.GSManager.Init(fleetConfig, zonePools, gameModesInZone)
+	if err != nil {
+		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}
 
 	//Check connection before spinning up the matchmaking queue
