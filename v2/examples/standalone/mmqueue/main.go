@@ -127,7 +127,7 @@ func main() {
 	// message bus, pub/sub system, or your platform service's notification
 	// service when returning assignments.
 	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "pubsub")
-	cfg.SetDefault("GCP_PROJECT_ID", "replace_me")
+	cfg.SetDefault("GCP_PROJECT_ID", "my-project-id")
 	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace_me")
 
 	// Read overrides from env vars
