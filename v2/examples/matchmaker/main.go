@@ -234,8 +234,14 @@ func main() {
 		// make a unique topic subscription.
 		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
 
-		// Instantiate the Pub/Sub receiver
+		// Instantiate the Pub/Sub Publisher
 		publisher = assignmentdistributor.NewPubSubPublisher(
+			cfg.GetString("GCP_PROJECT_ID"),
+			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
+			log,
+		)
+		// Instantiate the Pub/Sub Receiver
+		receiver = assignmentdistributor.NewPubSubSubscriber(
 			cfg.GetString("GCP_PROJECT_ID"),
 			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
 			log,
