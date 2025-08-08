@@ -158,6 +158,7 @@ func main() {
 		AssignmentPublisher: publisher,
 		OtelMeterPtr:        meterptr,
 	}
+
 	// In a real stand-alone director, you would read in your actual game server configuration and construct
 	// the FleetConfig, ZonePools, and GameModesInZone. For automated testing, we use the sample ones
 	// defined in the internal/gsdirector module.
