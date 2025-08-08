@@ -242,7 +242,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		bLogger.Info("Starting assignment receiver")
 		err := q.AssignmentReceiver.Receive(ctx, assignmentHandler)
 		if err != nil {
-			bLogger.Fatalf("Failed to start assignment receiver, please check your assignment distributor config: %v", err)
+			bLogger.Errorf("Assignment receiver error: %v", err)
 		}
 	}()
 
