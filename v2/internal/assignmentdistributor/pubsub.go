@@ -29,18 +29,20 @@ import (
 	"fmt"
 	"time"
 
-	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/pubsub/v2"
+	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
 	"github.com/google/uuid"
 	"github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // PubSubPublisher sends assignments to a Google Cloud Pub/Sub topic.
 type PubSubPublisher struct {
-	client *pubsub.Client
-	topic  *pubsub.Topic
-	log    *logrus.Logger
+	client    *pubsub.Client
+	publisher *pubsub.Publisher
+	log       *logrus.Logger
 }
 
 // NewPubSubPublisher does not create or delete topics for the publisher (It assumes the topic
@@ -59,14 +61,9 @@ func NewPubSubPublisher(projectID string, topicID string, log *logrus.Logger) *P
 		log.Fatalf("Failed to initialize pubsub client to receive assignments: %v", err)
 	}
 
-	// Connect to the Pub/Sub topic
-	topic := client.Topic(topicID)
-	if exists, err := topic.Exists(ctx); err != nil || !exists {
-		log.Fatalf("Pubsub topic '%s' produced an error or does not exist. Topic must be created and its ID specified in the config at startup time: %v", topicID, err)
-	}
-
-	// Instantiate the Pub/Sub receiver
-	return &PubSubPublisher{client: client, topic: topic, log: log}
+	// Connect to the Pub/Sub topic & instantiate the Pub/Sub receiver
+	publisher := client.Publisher(fmt.Sprintf("projects/%v/topics/%v", projectID, topicID))
+	return &PubSubPublisher{client: client, publisher: publisher, log: log}
 }
 
 func (p *PubSubPublisher) Send(ctx context.Context, roster *pb.Roster) error {
@@ -77,12 +74,11 @@ func (p *PubSubPublisher) Send(ctx context.Context, roster *pb.Roster) error {
 		return err
 	}
 
+	// Publish, return any error received.
 	msg := &pubsub.Message{Data: data}
-	result := p.topic.Publish(ctx, msg)
-
-	// Block until the result is returned and log any errors.
-	if _, err := result.Get(ctx); err != nil {
-		p.log.Errorf("Failed to publish message to Pub/Sub: %v", err)
+	results := p.publisher.Publish(ctx, msg)
+	if _, err := results.Get(ctx); err != nil {
+		p.log.Errorf("Pubsub topic '%s' produced an error or does not exist. Topic must be created and its ID specified in the config at startup time: %v", p.publisher.String(), err)
 		return err
 	}
 	return nil
@@ -90,15 +86,17 @@ func (p *PubSubPublisher) Send(ctx context.Context, roster *pb.Roster) error {
 
 func (p *PubSubPublisher) Stop() {
 	// cleanup function for Pub/Sub
-	p.log.Infof("Cleaning up assignment pubsub client, stopping topic %s", p.topic.ID())
+	p.log.Infof("Cleaning up assignment pubsub client, stopping topic %s", p.publisher.String())
+	p.publisher.Stop()
 	p.client.Close() // close the client connection.
 }
 
 // PubSubSubscriber receives assignments from a Google Cloud Pub/Sub subscription.
 type PubSubSubscriber struct {
-	client       *pubsub.Client
-	subscription *pubsub.Subscription
-	log          *logrus.Logger
+	client    *pubsub.Client
+	sub       *pubsub.Subscriber
+	ctxCancel context.CancelFunc
+	log       *logrus.Logger
 }
 
 func NewPubSubSubscriber(projectID string, topicID string, log *logrus.Logger) *PubSubSubscriber {
@@ -108,38 +106,46 @@ func NewPubSubSubscriber(projectID string, topicID string, log *logrus.Logger) *
 	}
 
 	// Create a Pub/Sub client
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
 	client, err := pubsub.NewClient(ctx, projectID)
 	if err != nil {
 		log.Fatalf("Failed to initialize pubsub client to receive assignments: %v", err)
 	}
 
-	// Connect to the Pub/Sub topic
-	topic := client.Topic(topicID)
-	if exists, err := topic.Exists(ctx); err != nil || !exists {
-		log.Fatalf("Pubsub topic '%s' produced an error or does not exist. Topic must be created and its ID specified in the config at startup time: %v", topicID, err)
-	}
-
 	// Unique subscription name for each application instance.
-	subID := fmt.Sprintf("mmqueue-%s-sub", uuid.NewString())
-	log.Infof("Creating subscription: %s", subID)
-	sub, err := client.CreateSubscription(ctx, subID, pubsub.SubscriptionConfig{
-		Topic:       topic,
-		AckDeadline: 20 * time.Second,
-		// The subscription will be automatically deleted by GCP after 24 hours
-		// of inactivity. This is a safeguard against orphaned resources if
-		// the app crashes without cleaning up.
-		ExpirationPolicy: 24 * time.Hour,
-	})
+	tName := fmt.Sprintf("projects/%v/topics/%v", projectID, topicID)
+	sName := fmt.Sprintf("projects/%v/subscriptions/mmqueue-%s-sub", projectID, uuid.NewString())
+	log.Infof("Creating subscription: '%s' for topic: '%s'", sName, tName)
+	sub, err := client.SubscriptionAdminClient.CreateSubscription(ctx,
+		&pubsubpb.Subscription{
+			// The subscription will be automatically deleted by GCP after 24 hours
+			// of inactivity. This is a safeguard against orphaned resources if
+			// the app crashes without cleaning up.
+			ExpirationPolicy: &pubsubpb.ExpirationPolicy{
+				Ttl: durationpb.New(24 * time.Hour),
+			},
+			Name:  sName,
+			Topic: tName,
+		},
+	)
 	if err != nil {
 		log.Fatalf("Failed to create Pub/Sub subscription: %v", err)
 	}
 
-	return &PubSubSubscriber{client: client, subscription: sub, log: log}
+	return &PubSubSubscriber{
+		client:    client,
+		sub:       client.Subscriber(sub.GetName()),
+		ctxCancel: cancel,
+		log:       log,
+	}
 }
 
+// Note: This uses pubsub's streaming pull feature. This feature has properties
+// that may be surprising. Please take a look at
+// https://cloud.google.com/pubsub/docs/pull#streamingpull for more details on
+// how streaming pull behaves compared to the synchronous pull method.
 func (r *PubSubSubscriber) Receive(ctx context.Context, handler func(ctx context.Context, roster *pb.Roster)) error {
-	return r.subscription.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
+	return r.sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
 		var roster pb.Roster
 		if err := proto.Unmarshal(msg.Data, &roster); err != nil {
 			r.log.Errorf("Failed to unmarshal roster from Pub/Sub message: %v", err)
@@ -154,17 +160,23 @@ func (r *PubSubSubscriber) Receive(ctx context.Context, handler func(ctx context
 
 // cleanup function for Pub/Sub
 func (r *PubSubSubscriber) Stop() {
-	r.log.Infof("Cleaning up assignment pubsub subscription %s...", r.subscription.ID())
+	r.log.Infof("Cleaning up assignment pubsub subscription %s...", r.sub.String())
 
-	// Use a new, short-lived context to ensure cleanup runs.
+	// Use a new, short-lived context to ensure subscription cleanup runs.
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	if err := r.subscription.Delete(cleanupCtx); err != nil {
-		r.log.Errorf("Failed to delete subscription %s: %v", r.subscription.ID(), err)
+	err := r.client.SubscriptionAdminClient.DeleteSubscription(
+		cleanupCtx,
+		&pubsubpb.DeleteSubscriptionRequest{Subscription: r.sub.String()},
+	)
+	if err != nil {
+		r.log.Errorf("Failed to delete subscription %s: %v", r.sub.String(), err)
 	} else {
-		r.log.Infof("Successfully deleted subscription %s", r.subscription.ID())
+		r.log.Infof("Successfully deleted subscription %s", r.sub.String())
 	}
+
+	// Cancelling the subscriber's context is the idiomatic way to quit listening to a subscription.
+	r.ctxCancel()
 
 	// close the client connection
 	r.client.Close()
