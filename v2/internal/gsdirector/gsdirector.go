@@ -1373,7 +1373,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 						},
 						backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)),
 						func(err error, bo time.Duration) {
-							d.Log.Warnf("Sending match session assignment temporary failure (backoff for %v)r: %v", err, bo)
+							d.Log.Warnf("Sending match session assignment temporary failure (backoff for %v): %v", err, bo)
 						},
 					)
 					if err == nil { // roster assignment successfully sent
