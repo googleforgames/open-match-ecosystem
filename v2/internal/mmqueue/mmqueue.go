@@ -35,6 +35,7 @@ import (
 	//soloduelServer "open-match.dev/functions/golang/soloduel"
 	//mmf "open-match.dev/mmf/server"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/omclient"
 )
 
@@ -47,14 +48,15 @@ var (
 // requests, queueing them to be sent to Open Match, and processing them
 // asynchronously.
 type MatchmakerQueue struct {
-	OmClient          *omclient.RestfulOMGrpcClient
-	Cfg               *viper.Viper
-	Log               *logrus.Logger
-	Tickets           sync.Map
-	ClientRequestChan chan *ClientRequest
-	AssignmentsChan   chan *pb.Roster
-	OtelMeterPtr      *metric.Meter
-	TPC               int64
+	OmClient           *omclient.RestfulOMGrpcClient
+	Cfg                *viper.Viper
+	Log                *logrus.Logger
+	Tickets            sync.Map
+	ClientRequestChan  chan *ClientRequest
+	AssignmentReceiver assignmentdistributor.Receiver
+	AssignmentsChan    chan *pb.Roster
+	OtelMeterPtr       *metric.Meter
+	TPC                int64
 }
 
 type ClientRequest struct {
@@ -192,17 +194,17 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		bLogger := q.Log.WithFields(logrus.Fields{
 			"operation": "ticket_assignment",
 		})
-		logger.Debug("processing incoming ticket assignments")
+		bLogger.Debug("processing incoming ticket assignments")
 
 		// Don't exit the Run() function as long as this goroutine is running.
 		wg.Add(1)
 		defer wg.Done()
 
-		assigned := make(map[string]bool) // TODO
-		var assignment string
-		for roster := range q.AssignmentsChan {
+		var assigned sync.Map
+
+		assignmentHandler := func(ctx context.Context, roster *pb.Roster) {
 			// Get the assignment string
-			assignment = roster.GetAssignment().GetConnection()
+			assignment := roster.GetAssignment().GetConnection()
 
 			// Loop through all tickets in the assignment roster
 			var ticket *pb.Ticket
@@ -210,14 +212,14 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 				// TODO: in reality, this is where your matchmaking queue would
 				// return the assignment to the game client. This sample
 				// instead just logs the assignment.
-				//
+
 				// Stop tracking this ticket; it's matchmaking is complete.
 				// Your matchmaker may wish to instead keep this for a time (in
 				// case the game client should be allowed to ask for the same
 				// assignment again later).
 				if _, existed := q.Tickets.LoadAndDelete(ticket.GetId()); existed {
 					bLogger.Debugf("Received ticket %v assignment: %v", ticket.GetId(), assignment)
-					assigned[ticket.GetId()] = true
+					assigned.Store(ticket.GetId(), true)
 					// Update metric
 					otelTicketAssignments.Add(ctx, 1)
 					// Get diff between now and ticket creation time, in milliseconds
@@ -228,7 +230,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 					otelTicketQueuedDurations.Record(ctx, float64(queuedDur.Microseconds()/1000))
 				} else {
 					otelTicketDeletionFailures.Add(ctx, 1)
-					if _, previouslyassigned := assigned[ticket.GetId()]; previouslyassigned {
+					if _, previouslyassigned := assigned.Load(ticket.GetId()); previouslyassigned {
 						bLogger.Debugf("PREVIOUSLY ASSIGNED ticket %v assignment: %v", ticket.GetId(), assignment)
 					} else {
 						bLogger.Debugf("FAILED UNTRACKED ticket %v assignment: %v", ticket.GetId(), assignment)
@@ -237,7 +239,11 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 			}
 
 		}
-
+		bLogger.Info("Starting assignment receiver")
+		err := q.AssignmentReceiver.Receive(ctx, assignmentHandler)
+		if err != nil {
+			bLogger.Errorf("Assignment receiver error: %v", err)
+		}
 	}()
 
 	// Don't exit the Run() function as long as any of the goroutines are

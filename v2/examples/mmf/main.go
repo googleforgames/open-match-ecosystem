@@ -30,7 +30,7 @@ package main
 
 import (
 	"github.com/spf13/viper"
-	mmf "open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/fifo"
+	mmf "open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/debug"
 	"open-match.dev/open-match-ecosystem/v2/examples/mmf/server"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 )

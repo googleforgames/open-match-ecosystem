@@ -140,7 +140,7 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 		}).Errorf("cannot unmarshal http response body back into protobuf")
 		return "", err
 	}
-	if resPb == nil {
+	if resPb.GetTicketId() == "" {
 		// Mark as a permanent error so the backoff library doesn't retry this REST call
 		err := backoff.Permanent(errors.New("CreateTicket returned empty result"))
 		logger.Error(err)
@@ -363,13 +363,13 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 				logger.Trace("Successfully unmarshalled HTTP response JSON body back into StreamedMmfResponse protobuf message")
 			}
 
-			if resPb == nil {
-				logger.Trace("StreamedMmfResponse protobuf was nil!")
+			if resPb.GetMatch() == nil {
+				logger.Trace("StreamedMmfResponse protobuf was empty!")
 				continue // Loop again to get the next streamed response
 			}
 
 			// Send back the streamed responses as we get them
-			logger.Trace("StreamedMmfResponse protobuf exists")
+			logger.Trace("StreamedMmfResponse protobuf exists and is not empty")
 			respChan <- resPb
 
 		}

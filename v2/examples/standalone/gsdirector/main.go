@@ -37,6 +37,8 @@ import (
 
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
+	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/gsdirector"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
@@ -62,15 +64,21 @@ func main() {
 
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
-	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
 	cfg.SetDefault("PORT", "8090")
 
 	// OM core config that the matchmaker needs to respect
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 
 	// InvokeMatchmaking Function config
-	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)                   // Default is essentially forever
-	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", 3) // Exit if 3 matchmaking cycles come back empty
+	// In production, you will want this to be functionally infinite, thus the
+	// use of the largest Int32 number possible.  However, when doing local
+	// development of matching logic, it is often useful to run a deterministic
+	// number of cycles.
+	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)
+	// Exit if 3 matchmaking cycles come back empty. Again, you probably don't
+	// want to do this in production, but it can be very useful in local
+	// testing.
+	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", math.MaxInt32)
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -82,6 +90,16 @@ func main() {
 	// Metrics config
 	cfg.SetDefault("OTEL_SIDECAR", "true")
 	cfg.SetDefault("OTEL_PROM_PORT", 2225)
+
+	// Assignment distribution config
+	// Returning assignments via channel only works if the mmqueue and the
+	// gsdirector are running in the same process, so you'll need to provide a
+	// different assignment return data flow.  We sugest using a distributed
+	// message bus, pub/sub system, or your platform service's notification
+	// service when returning assignments.
+	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "")
+	cfg.SetDefault("GCP_PROJECT_ID", "my-project-id")
+	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace-me")
 
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
@@ -100,6 +118,31 @@ func main() {
 	}
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 
+	// Initialize assignment distribution
+	var publisher assignmentdistributor.Sender
+	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
+	case "channel":
+		log.Info("Using Go channels for assignment distribution")
+		log.Error("Using Go channels for assignment distribution isn't possible unless the matchmaking queue and game server director are running in the same process, which should only be done when doing active local development. Since this is a standalone game server director process, the go channel will never be read, so assignments are effectively discarded with this configuration.")
+		assignmentsChan := make(chan *pb.Roster)
+		publisher = assignmentdistributor.NewChannelSender(assignmentsChan)
+	case "pubsub":
+		fallthrough // default is 'pubsub' in the standalone mmqueue
+	default:
+		// note: if using pubsub to send assignments from your director to your
+		// matchmaking queue, make sure you have sufficient quota for
+		// subscriptions in your GCP project. Each instance of the mmqueue will
+		// make a unique topic subscription.
+		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
+
+		// Instantiate the Pub/Sub receiver
+		publisher = assignmentdistributor.NewPubSubPublisher(
+			cfg.GetString("GCP_PROJECT_ID"),
+			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
+			log,
+		)
+	}
+
 	// Initialize the director
 	d := &gsdirector.MockDirector{
 		OmClient: &omclient.RestfulOMGrpcClient{
@@ -110,9 +153,10 @@ func main() {
 		GSManager: &gsdirector.MockAgonesIntegration{
 			Log: log,
 		},
-		Cfg:          cfg,
-		Log:          log,
-		OtelMeterPtr: meterptr,
+		Cfg:                 cfg,
+		Log:                 log,
+		AssignmentPublisher: publisher,
+		OtelMeterPtr:        meterptr,
 	}
 
 	// In a real stand-alone director, you would read in your actual game server configuration and construct
@@ -156,6 +200,7 @@ func main() {
 
 	// Wait for quit signal
 	<-signalChan
+	publisher.Stop()
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Fatal(err)
 	}

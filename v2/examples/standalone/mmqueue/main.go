@@ -81,6 +81,7 @@ import (
 	//soloduelServer "open-match.dev/functions/golang/soloduel"
 	//mmf "open-match.dev/mmf/server"
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"open-match.dev/open-match-ecosystem/v2/internal/assignmentdistributor"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 	"open-match.dev/open-match-ecosystem/v2/internal/metrics"
 	"open-match.dev/open-match-ecosystem/v2/internal/mmqueue"
@@ -119,6 +120,16 @@ func main() {
 	cfg.SetDefault("OTEL_SIDECAR", "true")
 	cfg.SetDefault("OTEL_PROM_PORT", 2224)
 
+	// Assignment distribution config
+	// Returning assignments via channel only works if the mmqueue and the
+	// gsdirector are running in the same process, so you'll need to provide a
+	// different assignment return data flow.  We sugest using a distributed
+	// message bus, pub/sub system, or your platform service's notification
+	// service when returning assignments.
+	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "pubsub")
+	cfg.SetDefault("GCP_PROJECT_ID", "my-project-id")
+	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace-me")
+
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
 
@@ -134,6 +145,31 @@ func main() {
 	}
 	defer otelShutdownFunc(ctx) //nolint:errcheck
 
+	// Initialize assignment distribution
+	var receiver assignmentdistributor.Receiver
+	switch cfg.GetString("ASSIGNMENT_DISTRIBUTION_PATH") {
+	case "channel":
+		log.Info("Using Go channels for assignment distribution")
+		log.Error("Using Go channels for assignment distribution isn't possible unless the matchmaking queue and game server director are running in the same process, which should only be done when doing active local development. Since this is a standalone matchmaking queue process, there is no game server director sending data on the go channel - assignments are effectively discarded with this configuration.")
+		assignmentsChan := make(chan *pb.Roster)
+		receiver = assignmentdistributor.NewChannelReceiver(assignmentsChan)
+	case "pubsub":
+		fallthrough // default is 'pubsub' in the standalone mmqueue
+	default:
+		// note: if using pubsub to send assignments from your director to your
+		// matchmaking queue, make sure you have sufficient quota for
+		// subscriptions in your GCP project. Each instance of the mmqueue will
+		// make a unique topic subscription.
+		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
+
+		// Instantiate the Pub/Sub receiver
+		receiver = assignmentdistributor.NewPubSubSubscriber(
+			cfg.GetString("GCP_PROJECT_ID"),
+			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
+			log,
+		)
+	}
+
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
 		OmClient: &omclient.RestfulOMGrpcClient{
@@ -141,11 +177,11 @@ func main() {
 			Log:    log,
 			Cfg:    cfg,
 		},
-		Cfg:               cfg,
-		Log:               log,
-		ClientRequestChan: make(chan *mmqueue.ClientRequest),
-		AssignmentsChan:   make(chan *pb.Roster),
-		OtelMeterPtr:      meterptr,
+		Cfg:                cfg,
+		Log:                log,
+		ClientRequestChan:  make(chan *mmqueue.ClientRequest),
+		AssignmentReceiver: receiver,
+		OtelMeterPtr:       meterptr,
 	}
 
 	//Check connection before spinning everything up.
@@ -203,6 +239,7 @@ func main() {
 
 	// Wait for quit signal
 	<-signalChan
+	receiver.Stop()
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Fatal(err)
 	}
