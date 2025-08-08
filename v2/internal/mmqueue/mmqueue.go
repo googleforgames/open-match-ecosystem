@@ -200,7 +200,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		wg.Add(1)
 		defer wg.Done()
 
-		assigned := make(map[string]bool) // This map might need to be a sync.Map concurrent access if handler runs in parallel
+		var assigned sync.Map
 
 		assignmentHandler := func(ctx context.Context, roster *pb.Roster) {
 			// Get the assignment string
@@ -219,7 +219,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 				// assignment again later).
 				if _, existed := q.Tickets.LoadAndDelete(ticket.GetId()); existed {
 					bLogger.Debugf("Received ticket %v assignment: %v", ticket.GetId(), assignment)
-					assigned[ticket.GetId()] = true
+					assigned.Store(ticket.GetId(), true)
 					// Update metric
 					otelTicketAssignments.Add(ctx, 1)
 					// Get diff between now and ticket creation time, in milliseconds
@@ -230,7 +230,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 					otelTicketQueuedDurations.Record(ctx, float64(queuedDur.Microseconds()/1000))
 				} else {
 					otelTicketDeletionFailures.Add(ctx, 1)
-					if _, previouslyassigned := assigned[ticket.GetId()]; previouslyassigned {
+					if _, previouslyassigned := assigned.Load(ticket.GetId()); previouslyassigned {
 						bLogger.Debugf("PREVIOUSLY ASSIGNED ticket %v assignment: %v", ticket.GetId(), assignment)
 					} else {
 						bLogger.Debugf("FAILED UNTRACKED ticket %v assignment: %v", ticket.GetId(), assignment)
