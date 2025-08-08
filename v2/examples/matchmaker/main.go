@@ -203,7 +203,7 @@ func main() {
 
 	// Only used if the ASSIGNMENT_DISTRIBUTION_PATH is set to 'pubsub'
 	cfg.SetDefault("GCP_PROJECT_ID", "my-project-id")
-	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace_me")
+	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace-me")
 
 	// Read overrides from env vars
 	cfg.AutomaticEnv()

@@ -99,7 +99,7 @@ func main() {
 	// service when returning assignments.
 	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "")
 	cfg.SetDefault("GCP_PROJECT_ID", "my-project-id")
-	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace_me")
+	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace-me")
 
 	// Read overrides from env vars
 	cfg.AutomaticEnv()
