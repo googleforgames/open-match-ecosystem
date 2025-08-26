@@ -407,7 +407,7 @@ func (m *MockAgonesIntegration) UpdateMMFRequest(defunctAllocationSpecJSON strin
 }
 
 // allocationSpecFromMMFRequests() generates a new allocation spec that will
-// allocate a server which can host a game sessions created by the input
+// allocate a server which can host a game session created by the input
 // mmfRequests.
 // TODO: move to lists if they become able to delete at allocation time
 // https://agones.dev/site/docs/guides/counters-and-lists/
@@ -466,7 +466,7 @@ func allocationSpecFromMMFRequests(mmfParams []*pb.MmfRequest, logger *logrus.Lo
 
 }
 
-// ProcessGameServerUpdatesis a mock for Agones Integration code you'd write to
+// ProcessGameServerUpdates is a mock for Agones Integration code you'd write to
 // handle UPDATE/CREATE/DELETE events from an Agones GameServer object listener
 // https://agones.dev/site/docs/guides/access-api/#best-practice-using-informers-and-listers
 func (m *MockAgonesIntegration) processGameServerUpdates() {
