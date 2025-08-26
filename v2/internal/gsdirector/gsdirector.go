@@ -1045,6 +1045,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 		// will keep  processing until it exits (so, make sure you always
 		// have an exit for your MMF Run() function!). For more details
 		// about why this is useful, read the documentation on MMF design.
+		// open-match-ecosystem/v2/examples/mmf/README.md
 		//
 		// NOTE: OM won't take longer than its configured timeout to return
 		// matches (determined by the OM_MMF_TIMEOUT_SECS config var in
