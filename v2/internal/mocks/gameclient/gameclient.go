@@ -24,7 +24,8 @@ package gameclient
 import (
 	"context"
 	"math/rand/v2"
-	_ "net/http"
+	// Register pprof HTTP handlers for profiling (revive: blank-imports).
+	// revive:disable-next-line:blank-imports
 	_ "net/http/pprof"
 	"strconv"
 	"time"
@@ -47,7 +48,7 @@ func Simple(ctx context.Context) *pb.Ticket {
 			// Make mock game client attributes.
 			Tags: []string{s},
 			DoubleArgs: map[string]float64{
-				// mock out a ping to this datacenter between 20-250ms
+				// mock out a ping to this datacenter between 20-120ms
 				"ping.asia-northeast1-a": float64(rand.IntN(maxPing-minPing) + minPing),
 			},
 			CreationTime: timestamppb.New(crTime),
