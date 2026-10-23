@@ -15,45 +15,122 @@ package assignmentdistributor
 
 import (
 	"context"
+	"errors"
+	"sync"
 
 	"github.com/googleforgames/open-match2/v2/pkg/pb"
 )
 
+// ErrSenderStopped is returned when attempting to send an assignment on a stopped ChannelSender.
+var ErrSenderStopped = errors.New("assignment channel sender is stopped")
+
 // ChannelSender sends assignments to a Go channel.
 type ChannelSender struct {
 	assignmentsChan chan<- *pb.Roster
+	mu              sync.RWMutex
+	stopped         bool
+	initOnce        sync.Once
+	stopOnce        sync.Once
+	stopChan        chan struct{}
 }
 
 func NewChannelSender(ch chan<- *pb.Roster) *ChannelSender {
-	return &ChannelSender{assignmentsChan: ch}
+	return &ChannelSender{
+		assignmentsChan: ch,
+		stopChan:        make(chan struct{}),
+	}
+}
+
+func (p *ChannelSender) ensureInit() {
+	p.initOnce.Do(func() {
+		if p.stopChan == nil {
+			p.stopChan = make(chan struct{})
+		}
+	})
 }
 
 func (p *ChannelSender) Send(ctx context.Context, roster *pb.Roster) error {
-	p.assignmentsChan <- roster
-	return nil
+	p.ensureInit()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.stopped {
+		return ErrSenderStopped
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.stopChan:
+		return ErrSenderStopped
+	case p.assignmentsChan <- roster:
+		return nil
+	}
 }
 
 func (p *ChannelSender) Stop() {
-	close(p.assignmentsChan)
+	p.ensureInit()
+	p.stopOnce.Do(func() {
+		close(p.stopChan)
+		p.mu.Lock()
+		p.stopped = true
+		if p.assignmentsChan != nil {
+			close(p.assignmentsChan)
+		}
+		p.mu.Unlock()
+	})
 }
 
 // ChannelReceiver receives assignments from a Go channel.
 type ChannelReceiver struct {
 	assignmentsChan <-chan *pb.Roster
+	initOnce        sync.Once
+	stopOnce        sync.Once
+	stopChan        chan struct{}
 }
 
 func NewChannelReceiver(ch <-chan *pb.Roster) *ChannelReceiver {
-	return &ChannelReceiver{assignmentsChan: ch}
+	return &ChannelReceiver{
+		assignmentsChan: ch,
+		stopChan:        make(chan struct{}),
+	}
+}
+
+func (r *ChannelReceiver) ensureInit() {
+	r.initOnce.Do(func() {
+		if r.stopChan == nil {
+			r.stopChan = make(chan struct{})
+		}
+	})
 }
 
 func (r *ChannelReceiver) Receive(ctx context.Context, handler func(ctx context.Context, roster *pb.Roster)) error {
-	go func() {
-		for roster := range r.assignmentsChan {
+	r.ensureInit()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-r.stopChan:
+			return nil
+		case roster, ok := <-r.assignmentsChan:
+			if !ok {
+				return nil
+			}
 			handler(ctx, roster)
 		}
-	}()
-	return nil
+	}
 }
 
-// For a channel, this is a no-op.
-func (r *ChannelReceiver) Stop() {}
+func (r *ChannelReceiver) Stop() {
+	r.ensureInit()
+	r.stopOnce.Do(func() {
+		close(r.stopChan)
+	})
+}
