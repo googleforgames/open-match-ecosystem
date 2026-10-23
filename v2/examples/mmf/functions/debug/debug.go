@@ -34,6 +34,7 @@ package debug
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"time"
 
@@ -99,6 +100,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 	req, err := server.GetChunkedRequest(stream)
 	if err != nil {
 		s.logger.Errorf("error getting chunked request: %v", err)
+		return err
 	}
 
 	// Print the name of the profile.
@@ -152,6 +154,11 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		printExtensions(pool.GetExtensions(), s.logger)
 	}
 
+	matchExtensions := maps.Clone(req.GetExtensions())
+	if matchExtensions == nil {
+		matchExtensions = make(map[string]*anypb.Any)
+	}
+
 	// Example of how to pass ticket analysis back to the game server director:
 	// just make an empty match with some extension fields you pre-defined, and
 	// return it.  Then, add code to your director to read those extension
@@ -172,7 +179,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		Rosters: make(map[string]*pb.Roster),
 		// It is best practice to copy all extensions in the profile over
 		// to each outgoing match.
-		Extensions: req.GetExtensions(),
+		Extensions: matchExtensions,
 	}
 
 	// Examples of adding data to the outgoing match's extensions field
@@ -181,7 +188,7 @@ func (s *mmfServer) Run(stream pb.MatchMakingFunctionService_RunServer) error {
 		s.logger.Errorf("Unable to create 'mmfName' extension for match %v", match.Id)
 	}
 
-	match.Extensions["profileName"], err = anypb.New(&knownpb.StringValue{Value: req.Name})
+	match.Extensions["profileName"], err = anypb.New(&knownpb.StringValue{Value: req.GetName()})
 	if err != nil {
 		s.logger.Errorf("Unable to create 'profileName' extension for match %v", match.Id)
 	}

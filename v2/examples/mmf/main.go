@@ -29,18 +29,40 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
-	mmf "open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/debug"
+	"open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/debug"
+	"open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/fifo"
 	"open-match.dev/open-match-ecosystem/v2/examples/mmf/server"
 	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 )
 
+func newMMFServer(funcName string, logger *logrus.Logger) (pb.MatchMakingFunctionServiceServer, error) {
+	switch strings.ToLower(strings.TrimSpace(funcName)) {
+	case "", "fifo":
+		return fifo.NewWithLogger(logger), nil
+	case "debug":
+		return debug.NewWithLogger(logger), nil
+	default:
+		return nil, fmt.Errorf("unknown MMF_FUNCTION %q (expected 'fifo' or 'debug')", funcName)
+	}
+}
+
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
 	// Init viper config with default port
 	cfg := viper.New()
 	cfg.SetDefault("PORT", 8080)
-	cfg.AutomaticEnv()
+	cfg.SetDefault("MMF_FUNCTION", "fifo")
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -48,12 +70,18 @@ func main() {
 	cfg.SetDefault("LOGGING_FORMAT", "json")
 	cfg.SetDefault("LOGGING_LEVEL", "info")
 	cfg.SetDefault("LOG_CALLER", "false")
+	cfg.AutomaticEnv()
 
 	// Initialize logging
 	logger := logging.NewSharedLogger(cfg)
 
-	customMatchingLogic := mmf.NewWithLogger(logger)
+	customMatchingLogic, err := newMMFServer(cfg.GetString("MMF_FUNCTION"), logger)
+	if err != nil {
+		logger.Fatal(err)
+	}
 
 	// Start a gRPC server that handles MMF requests
-	server.StartServer(cfg.GetInt32("PORT"), customMatchingLogic, logger)
+	if err := server.StartServerWithContext(ctx, cfg.GetInt32("PORT"), customMatchingLogic, logger); err != nil {
+		logger.Fatal(err)
+	}
 }

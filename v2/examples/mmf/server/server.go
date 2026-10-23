@@ -27,14 +27,13 @@
 package server
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"net"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
-	knownpb "google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 var (
@@ -43,32 +42,52 @@ var (
 		"component": "matchmaking_function",
 		"function":  "server",
 	}
-	log            = logrus.New()
-	logger         *logrus.Entry
-	NoSuchKeyError = errors.New("Extension field contains no such key")
+	log    = logrus.New()
+	logger = log.WithFields(logfields)
 )
 
 // StartServer creates and starts the Match Function server
 func StartServer(port int32, mmfServer pb.MatchMakingFunctionServiceServer, l *logrus.Logger) error {
+	return StartServerWithContext(context.Background(), port, mmfServer, l)
+}
+
+// StartServerWithContext creates and starts the Match Function server and stops it gracefully when ctx is done.
+func StartServerWithContext(ctx context.Context, port int32, mmfServer pb.MatchMakingFunctionServiceServer, l *logrus.Logger) error {
 	var err error
-	log = l
-	logger = log.WithFields(logfields)
+	if l != nil {
+		log = l
+		logger = log.WithFields(logfields)
+	}
 
 	// Create and host a new gRPC service on the requested port.
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		logger.Fatalf("TCP net listener initialization failed for port %v, got %s", port, err.Error())
+		logger.Errorf("TCP net listener initialization failed for port %v, got %s", port, err.Error())
+		return err
 	}
 
 	logger.Infof("MMF gRPC Server starting on TCP port %v ", port)
 	var opts []grpc.ServerOption
 	server := grpc.NewServer(opts...)
 	pb.RegisterMatchMakingFunctionServiceServer(server, mmfServer)
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			logger.Infof("Shutting down MMF gRPC Server gracefully")
+			server.GracefulStop()
+		case <-done:
+		}
+	}()
+
 	if err = server.Serve(ln); err != nil {
-		logger.Fatalf("gRPC serve failed, got %s", err.Error())
+		logger.Errorf("gRPC serve failed, got %s", err.Error())
+		return err
 	}
 
-	return err
+	return nil
 }
 
 // GetChunkedRequest receives a MMF Server request stream sending partial
@@ -97,6 +116,14 @@ func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Prof
 		for name, pool := range in.GetProfile().GetPools() {
 			logger.Debugf("concatinating pool %v", name)
 			if _, ok := pools[name]; !ok {
+				rosterName := pool.GetParticipants().GetName()
+				if rosterName == "" {
+					rosterName = name
+				}
+				srcTickets := pool.GetParticipants().GetTickets()
+				copiedTickets := make([]*pb.Ticket, len(srcTickets))
+				copy(copiedTickets, srcTickets)
+
 				// First chunk containing this pool; initialize the local copy.
 				pools[name] = &pb.Pool{
 					Name:                    pool.GetName(),
@@ -105,10 +132,24 @@ func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Prof
 					DoubleRangeFilters:      pool.GetDoubleRangeFilters(),
 					CreationTimeRangeFilter: pool.GetCreationTimeRangeFilter(),
 					Extensions:              pool.GetExtensions(),
-					Participants:            pool.GetParticipants(),
+					Participants: &pb.Roster{
+						Name:       rosterName,
+						Tickets:    copiedTickets,
+						Extensions: pool.GetParticipants().GetExtensions(),
+					},
 				}
 			} else {
 				// concate pools split amoung multiple chunks
+				if pools[name].Participants == nil {
+					rosterName := pool.GetParticipants().GetName()
+					if rosterName == "" {
+						rosterName = name
+					}
+					pools[name].Participants = &pb.Roster{
+						Name:       rosterName,
+						Extensions: pool.GetParticipants().GetExtensions(),
+					}
+				}
 				pools[name].Participants.Tickets = append(pools[name].Participants.Tickets, pool.GetParticipants().GetTickets()...)
 			}
 		}
@@ -133,19 +174,4 @@ func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Prof
 		}
 	}
 	return req, nil
-}
-
-// WIP, will move to its own module later
-// ExtensionInt32 is a simple helper function to get an int32 out of the extensions field
-// and make it a standard golang int.
-func ExtensionInt32(req *pb.Profile, exKey string) (out int, err error) {
-	int32Pb := &knownpb.Int32Value{}
-	if exValue, ok := req.GetExtensions()[exKey]; ok {
-		err = exValue.UnmarshalTo(int32Pb)
-		if err != nil {
-			return 0, err
-		}
-		return int(int32Pb.Value), err
-	}
-	return 0, NoSuchKeyError
 }
