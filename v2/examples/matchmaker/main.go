@@ -28,9 +28,11 @@ package main
 
 import (
 	"context"
+	"io"
 	"math"
 	"net/http"
-	_ "net/http"
+	// revive: blank-imports — pprof registers profiling HTTP handlers via side-effect import.
+	// revive:disable-next-line:blank-imports
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
@@ -65,12 +67,8 @@ import (
 
 var (
 	// global vars
-	statusUpdateMutex sync.RWMutex
-	cycleStatus       string
-	cfg               = viper.New()
-	tickets           sync.Map
-	otelShutdownFunc  func(context.Context) error
-	meterptr          *metric.Meter
+	otelShutdownFunc func(context.Context) error
+	meterptr         *metric.Meter
 
 	// configuration that requires recompilation
 	mockClientTicket = gameclient.Simple
@@ -92,19 +90,15 @@ var (
 		Extensions:              map[string]*anypb.Any{"testKey": testEx},
 	}
 
-	// The MMF request this type of game should use if the match is not filled.
-	backfillMMFs, _ = anypb.New(&pb.MmfRequest{Mmfs: []*pb.MatchmakingFunctionSpec{mmfFifo}})
 	// Define the parameters for a 'solo duel' (ffa) game mode.
 	soloduel = &gsdirector.GameMode{
 		Name:  "SoloDuel",
 		MMFs:  []*pb.MatchmakingFunctionSpec{mmfFifo, mmfDebug},
 		Pools: map[string]*pb.Pool{"all": everyTicketPool},
-		ExtensionParams: extensions.Combine(extensions.AnypbIntMap(map[string]int32{
+		ExtensionParams: extensions.AnypbIntMap(map[string]int32{
 			"desiredNumRosters": 1,
 			"desiredRosterLen":  4,
 			"minRosterLen":      2,
-		}), map[string]*anypb.Any{
-			extensions.MMFRequestKey: backfillMMFs,
 		}),
 	}
 	// Define which zones this game mode should be available in.
@@ -139,7 +133,7 @@ func main() {
 
 	// Read config
 	cfg := viper.New()
-	cfg.SetDefault("PORT", 8081)
+	cfg.SetDefault("PORT", 8080)
 
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
@@ -148,7 +142,7 @@ func main() {
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
 
 	// Ticket creation config
-	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 3)
+	cfg.SetDefault("MAX_CONCURRENT_TICKET_CREATIONS", 500)
 	cfg.SetDefault("INITIAL_TPC", 10)
 	cfg.SetDefault("TICKET_CREATION_CYCLE_DURATION_MS", 1000)
 	cfg.SetDefault("TICKET_CREATION_CYCLES", math.MaxInt32)
@@ -163,6 +157,10 @@ func main() {
 
 	// Exit if consequative matchmaking cycles come back empty. Again, you probably don't want to do this in production, but it can be very useful in local testing.
 	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", math.MaxInt32)
+
+	// Director match acceptance and backfill orchestration flags
+	cfg.SetDefault("REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT", false)
+	cfg.SetDefault("WAIT_FOR_BACKFILL_MMFS", false)
 
 	// MMF config
 	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
@@ -220,7 +218,11 @@ func main() {
 	} else {
 		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"))
 	}
-	defer otelShutdownFunc(ctx) //nolint:errcheck
+	defer func() {
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer flushCancel()
+		_ = otelShutdownFunc(flushCtx)
+	}()
 
 	// By default, create assignments channel used to funnel assignments from
 	// the director to the game clients.
@@ -257,19 +259,19 @@ func main() {
 
 	// Initialize the queue
 	q := &mmqueue.MatchmakerQueue{
-		OmClient: &omclient.RestfulOMGrpcClient{
-			Client: &http.Client{
+		OmClient: omclient.New(
+			cfg,
+			log,
+			&http.Client{
 				Transport: &http.Transport{
-					MaxIdleConns:        100,              // Maximum idle connections to keep open
-					MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+					MaxIdleConns:        500,              // Maximum idle connections to keep open
+					MaxIdleConnsPerHost: 500,              // Maximum idle connections per host
 					IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
 					DisableKeepAlives:   false,            // Make sure keep-alives are enabled
 				},
 				Timeout: 30 * time.Second,
 			},
-			Log: log,
-			Cfg: cfg,
-		},
+		),
 		Cfg:                cfg,
 		Log:                log,
 		ClientRequestChan:  make(chan *mmqueue.ClientRequest),
@@ -279,11 +281,18 @@ func main() {
 
 	// Initialize the director
 	d := &gsdirector.MockDirector{
-		OmClient: &omclient.RestfulOMGrpcClient{
-			Client: &http.Client{},
-			Log:    log,
-			Cfg:    cfg,
-		},
+		OmClient: omclient.New(
+			cfg,
+			log,
+			&http.Client{
+				Transport: &http.Transport{
+					MaxIdleConns:        100,              // Maximum idle connections to keep open
+					MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+					IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
+					DisableKeepAlives:   false,            // Make sure keep-alives are enabled
+				},
+			},
+		),
 		GSManager: &gsdirector.MockAgonesIntegration{
 			Log:          log,
 			OtelMeterPtr: meterptr,
@@ -301,13 +310,20 @@ func main() {
 	mmfFifo.Port = cfg.GetInt32("SOLODUEL_PORT")
 	mmfDebug.Host = cfg.GetString("DEBUGMMF_ADDR")
 	mmfDebug.Port = cfg.GetInt32("DEBUGMMF_PORT")
+	if err := soloduel.SetBackfillMMFs(mmfFifo); err != nil {
+		log.Errorf("Failure setting backfill MMFs on soloduel game mode: %v", err)
+	}
 	if cfg.GetString("SOLODUEL_ADDR") == "http://localhost" {
 		localTestMMF := fifo.NewWithLogger(log)
-		go mmfserver.StartServer(cfg.GetInt32("SOLODUEL_PORT"), localTestMMF, log)
+		go func() {
+			_ = mmfserver.StartServerWithContext(ctx, cfg.GetInt32("SOLODUEL_PORT"), localTestMMF, log)
+		}()
 	}
 	if cfg.GetString("DEBUGMMF_ADDR") == "http://localhost" {
 		localDebugMMF := debug.NewWithLogger(log)
-		go mmfserver.StartServer(cfg.GetInt32("DEBUGMMF_PORT"), localDebugMMF, log)
+		go func() {
+			_ = mmfserver.StartServerWithContext(ctx, cfg.GetInt32("DEBUGMMF_PORT"), localDebugMMF, log)
+		}()
 	}
 
 	// Initialize the game server manager used by the director
@@ -315,6 +331,8 @@ func main() {
 	if err != nil {
 		log.Errorf("Failure initializing game server manager matchmaking parameters: %v", err)
 	}
+
+	var wg sync.WaitGroup
 
 	//Check connection before spinning up the matchmaking queue
 	err = q.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
@@ -326,7 +344,11 @@ func main() {
 		}
 	}
 	// Start the ticket matchmaking queue. This is where tickets get processd and stored in OM2.
-	go q.Run(ctx)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		q.Run(ctx)
+	}()
 
 	//Check connection before spinning up the game server director
 	err = d.OmClient.ValidateConnection(ctx, cfg.GetString("OM_CORE_ADDR"))
@@ -339,7 +361,16 @@ func main() {
 	}
 	// Start the director. This is where profiles get sent to the InvokeMMFs()
 	// call, and matches returned.
-	go d.Run(ctx)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.Run(ctx)
+	}()
+
+	// Basic default handler that just returns the current matchmaking progress status as a string.
+	http.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, d.Status())
+	})
 
 	// Handler to manually insert 1 test ticket into the queue.
 	http.HandleFunc("/tickets", func(w http.ResponseWriter, r *http.Request) {
@@ -348,8 +379,8 @@ func main() {
 		// result.  In a real matchmaker, you need to keep this channel and
 		// process the status result in a way that makes sense to send back to
 		// your game client.
-		resultChan := make(chan int)
-		q.ClientRequestChan <- &mmqueue.ClientRequest{
+		resultChan := make(chan int, 1)
+		req := &mmqueue.ClientRequest{
 			ResultChan: resultChan,
 			Ticket: func(r *http.Request) *pb.Ticket {
 				// In a real game client, you'd probably use whatever communication
@@ -367,8 +398,23 @@ func main() {
 			}(r),
 		}
 
+		select {
+		case q.ClientRequestChan <- req:
+		case <-ctx.Done():
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+
 		// Write the http.Status code returned by the queue
-		w.WriteHeader(<-resultChan)
+		select {
+		case status := <-resultChan:
+			w.WriteHeader(status)
+		case <-r.Context().Done():
+			w.WriteHeader(http.StatusRequestTimeout)
+		}
 	})
 
 	// FOR TESTING ONLY
@@ -392,8 +438,8 @@ func main() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		// Hard cap of 10k per second to protect against mistyped http requests
-		if rTPC > 10000 {
+		// Hard cap of 10k per second and reject negative values to protect against mistyped http requests
+		if rTPC < 0 || rTPC > 10000 {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -417,9 +463,13 @@ func main() {
 
 	// Wait for quit signal
 	<-signalChan
+	cancel()
+	wg.Wait()
 	receiver.Stop()
 	publisher.Stop()
-	if err := srv.Shutdown(ctx); err != nil {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Fatal(err)
 	}
 	logger.Info("Exiting...")
