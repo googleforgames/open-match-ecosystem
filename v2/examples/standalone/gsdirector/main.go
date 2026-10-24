@@ -20,13 +20,15 @@ import (
 	"io"
 	"math"
 	"net/http"
-	_ "net/http"
+	// revive: blank-imports — pprof registers profiling HTTP handlers via side-effect import.
+	// revive:disable-next-line:blank-imports
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
@@ -34,7 +36,7 @@ import (
 
 	// Required for protojson to correctly parse JSON when unmarshalling to protobufs that contain
 	// 'well-known types' https://github.com/golang/protobuf/issues/1156
-
+	// revive:disable-next-line:blank-imports
 	_ "google.golang.org/protobuf/types/known/wrapperspb"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
@@ -46,12 +48,8 @@ import (
 )
 
 var (
-	statusUpdateMutex sync.RWMutex
-	cycleStatus       string
-	cfg               = viper.New()
-	tickets           sync.Map
-	meterptr          *metric.Meter
-	otelShutdownFunc  func(context.Context) error
+	meterptr         *metric.Meter
+	otelShutdownFunc func(context.Context) error
 )
 
 func main() {
@@ -62,9 +60,15 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	cfg := viper.New()
+
 	// Connection config.
 	cfg.SetDefault("OM_CORE_ADDR", "http://localhost:8080")
-	cfg.SetDefault("PORT", "8090")
+	cfg.SetDefault("PORT", 8080)
+	cfg.SetDefault("SOLODUEL_ADDR", "http://localhost")
+	cfg.SetDefault("SOLODUEL_PORT", 50090)
+	cfg.SetDefault("DEBUGMMF_ADDR", "")
+	cfg.SetDefault("DEBUGMMF_PORT", 50081)
 
 	// OM core config that the matchmaker needs to respect
 	cfg.SetDefault("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 500)
@@ -75,10 +79,13 @@ func main() {
 	// development of matching logic, it is often useful to run a deterministic
 	// number of cycles.
 	cfg.SetDefault("NUM_MM_CYCLES", math.MaxInt32)
+	cfg.SetDefault("MM_CYCLE_MIN_DURATION_MS", 5000)
 	// Exit if 3 matchmaking cycles come back empty. Again, you probably don't
 	// want to do this in production, but it can be very useful in local
 	// testing.
 	cfg.SetDefault("NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT", math.MaxInt32)
+	cfg.SetDefault("REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT", false)
+	cfg.SetDefault("WAIT_FOR_BACKFILL_MMFS", false)
 
 	// Override these with env vars when doing local development.
 	// Suggested values in that case are "text", "debug", and "false",
@@ -97,6 +104,7 @@ func main() {
 	// different assignment return data flow.  We sugest using a distributed
 	// message bus, pub/sub system, or your platform service's notification
 	// service when returning assignments.
+	cfg.SetDefault("ASSIGNMENT_TTL_MS", 1200000)
 	cfg.SetDefault("ASSIGNMENT_DISTRIBUTION_PATH", "")
 	cfg.SetDefault("GCP_PROJECT_ID", "my-project-id")
 	cfg.SetDefault("ASSIGNMENT_TOPIC_ID", "replace-me")
@@ -116,7 +124,11 @@ func main() {
 	} else {
 		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"))
 	}
-	defer otelShutdownFunc(ctx) //nolint:errcheck
+	defer func() {
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer flushCancel()
+		_ = otelShutdownFunc(flushCtx)
+	}()
 
 	// Initialize assignment distribution
 	var publisher assignmentdistributor.Sender
@@ -145,18 +157,41 @@ func main() {
 
 	// Initialize the director
 	d := &gsdirector.MockDirector{
-		OmClient: &omclient.RestfulOMGrpcClient{
-			Client: &http.Client{},
-			Log:    log,
-			Cfg:    cfg,
-		},
+		OmClient: omclient.New(
+			cfg,
+			log,
+			&http.Client{
+				Transport: &http.Transport{
+					MaxIdleConns:        100,              // Maximum idle connections to keep open
+					MaxIdleConnsPerHost: 100,              // Maximum idle connections per host
+					IdleConnTimeout:     90 * time.Second, // How long to keep idle connections open
+					DisableKeepAlives:   false,            // Make sure keep-alives are enabled
+				},
+			},
+		),
 		GSManager: &gsdirector.MockAgonesIntegration{
-			Log: log,
+			Log:          log,
+			OtelMeterPtr: meterptr,
 		},
 		Cfg:                 cfg,
 		Log:                 log,
 		AssignmentPublisher: publisher,
 		OtelMeterPtr:        meterptr,
+	}
+
+	gsdirector.Fifo.Host = cfg.GetString("SOLODUEL_ADDR")
+	gsdirector.Fifo.Port = cfg.GetInt32("SOLODUEL_PORT")
+	gsdirector.SoloDuel.MMFs = []*pb.MatchmakingFunctionSpec{gsdirector.Fifo}
+	if cfg.GetString("DEBUGMMF_ADDR") != "" {
+		gsdirector.SoloDuel.MMFs = append(gsdirector.SoloDuel.MMFs, &pb.MatchmakingFunctionSpec{
+			Name: "DEBUG",
+			Host: cfg.GetString("DEBUGMMF_ADDR"),
+			Port: cfg.GetInt32("DEBUGMMF_PORT"),
+			Type: pb.MatchmakingFunctionSpec_GRPC,
+		})
+	}
+	if err := gsdirector.SoloDuel.SetBackfillMMFs(gsdirector.Fifo); err != nil {
+		log.Errorf("Failure setting backfill MMFs on soloduel game mode: %v", err)
 	}
 
 	// In a real stand-alone director, you would read in your actual game server configuration and construct
@@ -179,13 +214,16 @@ func main() {
 
 	// Start the director. This is where profiles get sent to the InvokeMMFs()
 	// call, and matches returned.
-	go d.Run(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.Run(ctx)
+	}()
 
 	// Basic default handler that just returns the current matchmaking progress status as a string.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		statusUpdateMutex.RLock()
-		defer statusUpdateMutex.RUnlock()
-		io.WriteString(w, cycleStatus)
+	http.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, d.Status())
 	})
 
 	// Start http server so this application can be run on serverless platforms.
@@ -200,8 +238,12 @@ func main() {
 
 	// Wait for quit signal
 	<-signalChan
+	cancel()
+	wg.Wait()
 	publisher.Stop()
-	if err := srv.Shutdown(ctx); err != nil {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Fatal(err)
 	}
 	logger.Info("Exiting...")
