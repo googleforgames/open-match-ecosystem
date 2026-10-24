@@ -1,0 +1,97 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# To use this cloudbuild.yaml from its directory:
+#   gcloud builds submit --async --no-source
+#
+# Depending on how your project is set up, you may need to add the required Cloud Run role
+# (https://cloud.google.com/run/docs/reference/iam/roles) to the Cloud Build
+# service account using a gcloud command like this:
+#   gcloud projects add-iam-policy-binding $(gcloud config get project) \
+#     --member=serviceAccount:$(gcloud projects list --filter=$(gcloud config get project) --format="value(PROJECT_NUMBER)")-compute@developer.gserviceaccount.com \
+#     --role=roles/run.developer
+# You probably also need to allow Cloud Build to deploy using this application's custom Cloud Run _SERVICE_ACCOUNT:
+#   gcloud iam service-accounts add-iam-policy-binding \
+#     <_SERVICE_ACCOUNT>@$(gcloud config get project).iam.gserviceaccount.com \
+#     --role=roles/iam.serviceAccountUser \
+#     --member=serviceAccount:$(gcloud projects list --filter=$(gcloud config get project) --format="value(PROJECT_NUMBER)")-compute@developer.gserviceaccount.com
+
+substitutions:
+  # Cloud deploy vars
+  _JOB_NAME: soloduel
+  _REGION: us-central1
+  _SERVICE_ACCOUNT: soloduel-identity
+  _ARTIFACT_REGISTRY_REPO: open-match-2-Test
+  _MMF_IMAGE_NAME: om-FIFO-mmf:0.0.1
+  _OTEL_SIDECAR_IMAGE: otel-collector-sidecar
+
+  # Application environment vars
+  _MMF_FUNCTION: fifo
+  _LOGGING_LEVEL: info
+
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: "Deploy:ingress internal, all egress vpc"
+    waitFor: ["-"]
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      # service config
+      - ${_JOB_NAME}
+      - --platform
+      - managed
+      - --region
+      - ${_REGION}
+      - --no-allow-unauthenticated
+      - --service-account
+      - ${_SERVICE_ACCOUNT}
+      - --no-cpu-throttling
+      - --execution-environment
+      - gen2
+      - --use-http2
+
+      # Network config
+      - --network
+      - default
+      - --subnet
+      - default
+      - --vpc-egress
+      - all-traffic
+
+      # ingress config
+      - --ingress
+      - internal
+
+      # sidecar 'opentelemetry-collector' config
+      - --container
+      - opentelemetry-collector
+      - --image
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_OTEL_SIDECAR_IMAGE}'
+
+      # main 'mmf' container config
+      - --container
+      - mmf
+      - --image
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_MMF_IMAGE_NAME}'
+      - --port
+      - "8080"
+      - --memory
+      - 1024Mi
+
+      # env vars for 'mmf'
+      - --update-env-vars
+      - "MMF_FUNCTION=${_MMF_FUNCTION}"
+      - --update-env-vars
+      - "LOGGING_LEVEL=${_LOGGING_LEVEL}"
