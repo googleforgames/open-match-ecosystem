@@ -18,9 +18,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
-	"math"
 	"net"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +29,9 @@ import (
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	knownpb "google.golang.org/protobuf/types/known/wrapperspb"
 	"open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/debug"
 	"open-match.dev/open-match-ecosystem/v2/examples/mmf/functions/fifo"
@@ -71,6 +74,92 @@ func (f *fakeRunServer) Send(resp *pb.StreamedMmfResponse) error {
 	}
 	f.responses = append(f.responses, resp)
 	return nil
+}
+
+type blockingMMFService struct {
+	pb.UnimplementedMatchMakingFunctionServiceServer
+	entered chan struct{}
+}
+
+func (b *blockingMMFService) Run(stream pb.MatchMakingFunctionService_RunServer) error {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+func discardLogEntry() *logrus.Entry {
+	l := logrus.New()
+	l.SetOutput(io.Discard)
+	return logrus.NewEntry(l)
+}
+
+func runFIFOOnce(t *testing.T, profile *pb.Profile) []*pb.Match {
+	t.Helper()
+	l := logrus.New()
+	l.SetOutput(io.Discard)
+	srv := fifo.NewWithLogger(l)
+	stream := &fakeRunServer{
+		chunks: []*pb.ChunkedMmfRunRequest{
+			{NumChunks: 1, Profile: profile},
+		},
+	}
+	if err := srv.Run(stream); err != nil {
+		t.Fatalf("fifo.Run(%q) returned unexpected error: %v", profile.GetName(), err)
+	}
+	matches := make([]*pb.Match, 0, len(stream.responses))
+	for _, resp := range stream.responses {
+		matches = append(matches, resp.GetMatch())
+	}
+	return matches
+}
+
+func ticketAt(id string, created time.Time) *pb.Ticket {
+	return &pb.Ticket{
+		Id: id,
+		Attributes: &pb.Ticket_FilterableData{
+			CreationTime: timestamppb.New(created),
+		},
+	}
+}
+
+func sortedMatchTicketIDs(m *pb.Match) []string {
+	var ids []string
+	for _, roster := range m.GetRosters() {
+		for _, tk := range roster.GetTickets() {
+			ids = append(ids, tk.GetId())
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func reserveFreePort(t *testing.T) int32 {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	port := int32(ln.Addr().(*net.TCPAddr).Port)
+	_ = ln.Close()
+	return port
+}
+
+func waitForPortReady(t *testing.T, port int32) {
+	t.Helper()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for port %d to accept connections", port)
 }
 
 func mustAnyInt32(t *testing.T, v int32) *anypb.Any {
@@ -127,6 +216,42 @@ func TestMMFServerFactoryDispatch(t *testing.T) {
 			}
 			if srv != nil {
 				t.Fatalf("newMMFServer(%q) expected nil server on error, got %v", invalid, srv)
+			}
+		})
+	}
+}
+
+func TestBaseProfileName(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: "dev.open-match.fleet.mode.1730000000",
+			want:  "dev.open-match.fleet.mode",
+		},
+		{
+			input: "backfill.dev.open-match.fleet.mode.1730000-3",
+			want:  "dev.open-match.fleet.mode",
+		},
+		{
+			input: "backfill.backfill.dev.open-match.fleet.mode.42",
+			want:  "backfill.dev.open-match.fleet.mode",
+		},
+		{
+			input: "my-profile",
+			want:  "my-profile",
+		},
+		{
+			input: "backfill.my-profile.123-0",
+			want:  "my-profile",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			if got := server.BaseProfileName(tc.input); got != tc.want {
+				t.Fatalf("BaseProfileName(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
 	}
@@ -198,7 +323,7 @@ func TestGetChunkedRequestMultiChunkEmptyPoolAndSliceIsolation(t *testing.T) {
 		chunks: []*pb.ChunkedMmfRunRequest{chunk1, chunk2},
 	}
 
-	profile, err := server.GetChunkedRequest(stream)
+	profile, err := server.GetChunkedRequest(stream, discardLogEntry())
 	if err != nil {
 		t.Fatalf("GetChunkedRequest returned unexpected error: %v", err)
 	}
@@ -259,7 +384,7 @@ func TestStreamRecvErrorPropagation(t *testing.T) {
 
 	t.Run("GetChunkedRequest", func(t *testing.T) {
 		stream := &fakeRunServer{recvErr: expectedErr}
-		prof, err := server.GetChunkedRequest(stream)
+		prof, err := server.GetChunkedRequest(stream, discardLogEntry())
 		if !errors.Is(err, expectedErr) {
 			t.Fatalf("GetChunkedRequest err = %v, want %v", err, expectedErr)
 		}
@@ -291,6 +416,255 @@ func TestStreamRecvErrorPropagation(t *testing.T) {
 			t.Fatalf("debug.Run sent %d responses on error, want 0", len(stream.responses))
 		}
 	})
+}
+
+func TestFIFOOrdersByCreationTime(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	profile := &pb.Profile{
+		Name: "dev.open-match.fleet.mode.1",
+		Pools: map[string]*pb.Pool{
+			"p1": {
+				Name: "p1",
+				Participants: &pb.Roster{
+					Name: "p1",
+					Tickets: []*pb.Ticket{
+						ticketAt("newest", base.Add(5*time.Second)),
+						ticketAt("tie-b", base.Add(2*time.Second)),
+						ticketAt("oldest", base),
+					},
+				},
+			},
+			"p2": {
+				Name: "p2",
+				Participants: &pb.Roster{
+					Name: "p2",
+					Tickets: []*pb.Ticket{
+						ticketAt("second", base.Add(1*time.Second)),
+						ticketAt("tie-a", base.Add(2*time.Second)),
+						ticketAt("oldest", base),
+					},
+				},
+			},
+		},
+		Extensions: map[string]*anypb.Any{
+			"desiredNumRosters": mustAnyInt32(t, 1),
+			"desiredRosterLen":  mustAnyInt32(t, 2),
+			"minRosterLen":      mustAnyInt32(t, 2),
+		},
+	}
+
+	matches := runFIFOOnce(t, profile)
+	if len(matches) != 2 {
+		t.Fatalf("got %d matches, want 2", len(matches))
+	}
+
+	wantRosters := [][]string{
+		{"oldest", "second"},
+		{"tie-a", "tie-b"},
+	}
+	for idx, want := range wantRosters {
+		if len(matches[idx].GetRosters()) != 1 {
+			t.Fatalf("match[%d] roster count = %d, want 1", idx, len(matches[idx].GetRosters()))
+		}
+		var got []string
+		for _, r := range matches[idx].GetRosters() {
+			for _, tk := range r.GetTickets() {
+				got = append(got, tk.GetId())
+			}
+		}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("match[%d] tickets = %v, want %v", idx, got, want)
+		}
+	}
+}
+
+func TestFIFOMatchIDsAndBackfillNaming(t *testing.T) {
+	emptyMmfReqAny, err := anypb.New(&pb.MmfRequest{})
+	if err != nil {
+		t.Fatalf("failed to pack empty MmfRequest: %v", err)
+	}
+
+	buildProfile := func(name string) *pb.Profile {
+		return &pb.Profile{
+			Name: name,
+			Pools: map[string]*pb.Pool{
+				"p1": {
+					Name: "p1",
+					Participants: &pb.Roster{
+						Name: "p1",
+						Tickets: []*pb.Ticket{
+							{Id: "a"},
+							{Id: "b"},
+							{Id: "c"},
+							{Id: "d"},
+							{Id: "e"},
+						},
+					},
+				},
+			},
+			Extensions: map[string]*anypb.Any{
+				"desiredNumRosters":      mustAnyInt32(t, 1),
+				"desiredRosterLen":       mustAnyInt32(t, 2),
+				"minRosterLen":           mustAnyInt32(t, 1),
+				extensions.MMFRequestKey: emptyMmfReqAny,
+			},
+		}
+	}
+
+	run1 := runFIFOOnce(t, buildProfile("dev.open-match.fleet.mode.111"))
+	run2 := runFIFOOnce(t, buildProfile("dev.open-match.fleet.mode.222"))
+	if len(run1) != 3 {
+		t.Fatalf("run1 produced %d matches, want 3", len(run1))
+	}
+	if len(run2) != 3 {
+		t.Fatalf("run2 produced %d matches, want 3", len(run2))
+	}
+
+	seenMatchIDs := make(map[string]struct{})
+	seenRosterNames := make(map[string]struct{})
+	const wantMatchPrefix = "simple-fifo-matchfunction.dev.open-match.fleet.mode."
+
+	for _, batch := range [][]*pb.Match{run1, run2} {
+		for _, m := range batch {
+			id := m.GetId()
+			if _, dup := seenMatchIDs[id]; dup {
+				t.Fatalf("duplicate match ID %q", id)
+			}
+			seenMatchIDs[id] = struct{}{}
+
+			if !strings.HasPrefix(id, wantMatchPrefix) {
+				t.Fatalf("match ID = %q, want prefix %q", id, wantMatchPrefix)
+			}
+			rem := strings.TrimPrefix(id, wantMatchPrefix)
+			if rem == "" || strings.Contains(rem, ".") {
+				t.Fatalf("match ID suffix = %q, want non-empty dot-free string", rem)
+			}
+
+			for rName := range m.GetRosters() {
+				if _, dup := seenRosterNames[rName]; dup {
+					t.Fatalf("duplicate roster name %q", rName)
+				}
+				seenRosterNames[rName] = struct{}{}
+			}
+		}
+	}
+
+	// Third match of the first run (1 ticket) must carry a bounded backfill profile.
+	bfReq1, err := extensions.MMFRequest(run1[2].GetExtensions(), extensions.MMFRequestKey)
+	if err != nil {
+		t.Fatalf("expected backfill MmfRequest on partial match, got err: %v", err)
+	}
+	bfProf1 := bfReq1.GetProfile()
+	const wantBfPrefix = "backfill.dev.open-match.fleet.mode."
+	if !strings.HasPrefix(bfProf1.GetName(), wantBfPrefix) {
+		t.Fatalf("backfill profile name = %q, want prefix %q", bfProf1.GetName(), wantBfPrefix)
+	}
+	bfSuffix1 := strings.TrimPrefix(bfProf1.GetName(), wantBfPrefix)
+	if bfSuffix1 == "" || strings.Contains(bfSuffix1, ".") {
+		t.Fatalf("backfill profile suffix = %q, want non-empty dot-free string", bfSuffix1)
+	}
+	lastDot := strings.LastIndex(bfProf1.GetName(), ".")
+	if gotTruncated := bfProf1.GetName()[:lastDot]; gotTruncated != "backfill.dev.open-match.fleet.mode" {
+		t.Fatalf("truncated backfill profile name = %q, want %q", gotTruncated, "backfill.dev.open-match.fleet.mode")
+	}
+
+	// Run the backfill profile itself as another partial round; verify no nested backfill prefixes.
+	bfProf1.Pools["p1"].Participants = &pb.Roster{
+		Name:    "p1",
+		Tickets: []*pb.Ticket{{Id: "z"}},
+	}
+	bfProf1.Extensions[extensions.MMFRequestKey] = emptyMmfReqAny
+	bfProf1.Extensions["desiredRosterLen"] = mustAnyInt32(t, 2)
+
+	bfMatches := runFIFOOnce(t, bfProf1)
+	if len(bfMatches) != 1 {
+		t.Fatalf("backfill run produced %d matches, want 1", len(bfMatches))
+	}
+	bfMatch := bfMatches[0]
+	if _, dup := seenMatchIDs[bfMatch.GetId()]; dup {
+		t.Fatalf("duplicate match ID on backfill run: %q", bfMatch.GetId())
+	}
+	for rName := range bfMatch.GetRosters() {
+		if _, dup := seenRosterNames[rName]; dup {
+			t.Fatalf("duplicate roster name on backfill run: %q", rName)
+		}
+	}
+
+	const wantBfMatchPrefix = "simple-fifo-matchfunction.backfill.dev.open-match.fleet.mode."
+	if !strings.HasPrefix(bfMatch.GetId(), wantBfMatchPrefix) {
+		t.Fatalf("backfill match ID = %q, want prefix %q", bfMatch.GetId(), wantBfMatchPrefix)
+	}
+	bfMatchRem := strings.TrimPrefix(bfMatch.GetId(), wantBfMatchPrefix)
+	if bfMatchRem == "" || strings.Contains(bfMatchRem, ".") {
+		t.Fatalf("backfill match ID suffix = %q, want non-empty dot-free string", bfMatchRem)
+	}
+
+	bfReq2, err := extensions.MMFRequest(bfMatch.GetExtensions(), extensions.MMFRequestKey)
+	if err != nil {
+		t.Fatalf("expected second-round backfill MmfRequest, got err: %v", err)
+	}
+	bfProf2Name := bfReq2.GetProfile().GetName()
+	if !strings.HasPrefix(bfProf2Name, wantBfPrefix) {
+		t.Fatalf("second-round backfill profile name = %q, want prefix %q", bfProf2Name, wantBfPrefix)
+	}
+	bfSuffix2 := strings.TrimPrefix(bfProf2Name, wantBfPrefix)
+	if bfSuffix2 == "" || strings.Contains(bfSuffix2, ".") {
+		t.Fatalf("second-round backfill profile suffix = %q, want non-empty dot-free string (no nested prefixes)", bfSuffix2)
+	}
+}
+
+func TestFIFOBackfillCapacityUnevenRosters(t *testing.T) {
+	emptyMmfReqAny, err := anypb.New(&pb.MmfRequest{})
+	if err != nil {
+		t.Fatalf("failed to pack empty MmfRequest: %v", err)
+	}
+
+	var tickets []*pb.Ticket
+	for i := 1; i <= 7; i++ {
+		tickets = append(tickets, &pb.Ticket{Id: fmt.Sprintf("t%d", i)})
+	}
+
+	profile := &pb.Profile{
+		Name: "dev.open-match.fleet.teams.1",
+		Pools: map[string]*pb.Pool{
+			"p1": {
+				Name: "p1",
+				Participants: &pb.Roster{
+					Name:    "p1",
+					Tickets: tickets,
+				},
+			},
+		},
+		Extensions: map[string]*anypb.Any{
+			"desiredNumRosters":      mustAnyInt32(t, 2),
+			"desiredRosterLen":       mustAnyInt32(t, 4),
+			"minRosterLen":           mustAnyInt32(t, 2),
+			extensions.MMFRequestKey: emptyMmfReqAny,
+		},
+	}
+
+	matches := runFIFOOnce(t, profile)
+	if len(matches) != 1 {
+		t.Fatalf("got %d matches, want 1", len(matches))
+	}
+
+	gotIDs := sortedMatchTicketIDs(matches[0])
+	if len(gotIDs) != 7 {
+		t.Fatalf("match ticket count = %d (%v), want 7", len(gotIDs), gotIDs)
+	}
+
+	bfReq, err := extensions.MMFRequest(matches[0].GetExtensions(), extensions.MMFRequestKey)
+	if err != nil {
+		t.Fatalf("expected backfill MmfRequest on partial match, got err: %v", err)
+	}
+	bfExt := bfReq.GetProfile().GetExtensions()
+
+	for _, key := range []string{"desiredNumRosters", "desiredRosterLen", "minRosterLen"} {
+		val, err := extensions.Int32(bfExt, key)
+		if err != nil || val != 1 {
+			t.Fatalf("backfill %s = %d (err=%v), want 1", key, val, err)
+		}
+	}
 }
 
 func TestFIFOOverlappingPoolDeduplicationFullAndBackfillMatch(t *testing.T) {
@@ -517,21 +891,33 @@ func TestDebugMMFDiagnosticMatchAndExtensionIsolation(t *testing.T) {
 		if len(match.GetRosters()) != 0 {
 			t.Fatalf("debug match rosters count = %d, want 0", len(match.GetRosters()))
 		}
-		score, err := extensions.Int32(match.GetExtensions(), "score")
-		if err != nil || score != math.MinInt32 {
-			t.Fatalf("debug match score = %d (err=%v), want %d", score, err, math.MinInt32)
+		poolCount, err := extensions.Int32(match.GetExtensions(), "debug.pool-ticket-count/p1")
+		if err != nil || poolCount != 1 {
+			t.Fatalf("debug match debug.pool-ticket-count/p1 = %d (err=%v), want 1", poolCount, err)
+		}
+		if _, hasScore := match.GetExtensions()["score"]; hasScore {
+			t.Fatalf("debug match unexpectedly contains 'score' extension")
 		}
 		profName, err := extensions.String(match.GetExtensions(), "profileName")
 		if err != nil || profName != "debug-test-profile" {
 			t.Fatalf("debug match profileName = %q (err=%v), want %q", profName, err, "debug-test-profile")
 		}
+		customVal, err := extensions.String(match.GetExtensions(), "customParam")
+		if err != nil || customVal != "value1" {
+			t.Fatalf("debug match customParam = %q (err=%v), want %q", customVal, err, "value1")
+		}
+		const wantPrefix = "profile-debug-matchfunction.debug-test-profile."
+		if !strings.HasPrefix(match.GetId(), wantPrefix) {
+			t.Fatalf("debug match ID = %q, want prefix %q", match.GetId(), wantPrefix)
+		}
+		rem := strings.TrimPrefix(match.GetId(), wantPrefix)
+		if rem == "" || strings.Contains(rem, ".") {
+			t.Fatalf("debug match ID remainder = %q, want non-empty dot-free string", rem)
+		}
 
 		// Ensure original extensions map was not mutated.
 		if len(origExtensions) != 1 {
 			t.Fatalf("original profile Extensions mutated: got %d keys, want 1", len(origExtensions))
-		}
-		if _, exists := origExtensions["score"]; exists {
-			t.Fatalf("original profile Extensions was mutated with 'score' key")
 		}
 	})
 
@@ -553,9 +939,15 @@ func TestDebugMMFDiagnosticMatchAndExtensionIsolation(t *testing.T) {
 			t.Fatalf("debug.Run sent %d matches, want 1", len(stream.responses))
 		}
 		match := stream.responses[0].GetMatch()
-		score, err := extensions.Int32(match.GetExtensions(), "score")
-		if err != nil || score != math.MinInt32 {
-			t.Fatalf("debug match score = %d (err=%v), want %d", score, err, math.MinInt32)
+		if match.GetId() == "" {
+			t.Fatalf("expected non-empty match ID")
+		}
+		if len(match.GetRosters()) != 0 {
+			t.Fatalf("debug match rosters count = %d, want 0", len(match.GetRosters()))
+		}
+		mmfName, err := extensions.String(match.GetExtensions(), "mmfName")
+		if err != nil || mmfName != "profile-debug-matchfunction" {
+			t.Fatalf("debug match mmfName = %q (err=%v), want %q", mmfName, err, "profile-debug-matchfunction")
 		}
 	})
 }
@@ -573,13 +965,7 @@ func TestStartServerWithContextListenErrorAndGracefulStop(t *testing.T) {
 	})
 
 	t.Run("graceful_stop_on_context_cancel", func(t *testing.T) {
-		// Reserve an ephemeral port, then release it so StartServerWithContext can bind it.
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("failed to find free port: %v", err)
-		}
-		port := int32(ln.Addr().(*net.TCPAddr).Port)
-		_ = ln.Close()
+		port := reserveFreePort(t)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		errCh := make(chan error, 1)
@@ -587,17 +973,7 @@ func TestStartServerWithContextListenErrorAndGracefulStop(t *testing.T) {
 			errCh <- server.StartServerWithContext(ctx, port, mmfSrv, logger)
 		}()
 
-		// Wait until the TCP port is accepting connections, then cancel context.
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			conn, dialErr := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strings.TrimSpace(ln.Addr().String()[strings.LastIndex(ln.Addr().String(), ":")+1:])), 50*time.Millisecond)
-			if dialErr == nil {
-				_ = conn.Close()
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-
+		waitForPortReady(t, port)
 		cancel()
 
 		select {
@@ -607,6 +983,119 @@ func TestStartServerWithContextListenErrorAndGracefulStop(t *testing.T) {
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatalf("timed out waiting for StartServerWithContext to return after ctx cancellation")
+		}
+	})
+
+	t.Run("concurrent_servers_with_own_loggers", func(t *testing.T) {
+		port1 := reserveFreePort(t)
+		port2 := reserveFreePort(t)
+		if port2 == port1 {
+			port2 = reserveFreePort(t)
+		}
+
+		logger1 := logrus.New()
+		logger1.SetOutput(io.Discard)
+		logger2 := logrus.New()
+		logger2.SetOutput(io.Discard)
+
+		srv1 := fifo.NewWithLogger(logger1)
+		srv2 := fifo.NewWithLogger(logger2)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		errCh1 := make(chan error, 1)
+		errCh2 := make(chan error, 1)
+		go func() {
+			errCh1 <- server.StartServerWithContext(ctx, port1, srv1, logger1)
+		}()
+		go func() {
+			errCh2 <- server.StartServerWithContext(ctx, port2, srv2, logger2)
+		}()
+
+		waitForPortReady(t, port1)
+		waitForPortReady(t, port2)
+
+		cancel()
+
+		for i, ch := range []chan error{errCh1, errCh2} {
+			select {
+			case err := <-ch:
+				if err != nil {
+					t.Fatalf("server %d returned unexpected error: %v", i+1, err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("timed out waiting for server %d to stop", i+1)
+			}
+		}
+	})
+
+	t.Run("hung_run_force_stopped_after_deadline", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping graceful-stop timeout test in short mode")
+		}
+
+		port := reserveFreePort(t)
+		blocker := &blockingMMFService{
+			entered: make(chan struct{}, 1),
+		}
+		srvLogger := logrus.New()
+		srvLogger.SetOutput(io.Discard)
+
+		srvCtx, srvCancel := context.WithCancel(context.Background())
+		defer srvCancel()
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- server.StartServerWithContext(srvCtx, port, blocker, srvLogger)
+		}()
+
+		waitForPortReady(t, port)
+
+		conn, err := grpc.NewClient(
+			fmt.Sprintf("127.0.0.1:%d", port),
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+		if err != nil {
+			t.Fatalf("grpc.NewClient failed: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		rpcCtx, rpcCancel := context.WithCancel(context.Background())
+		defer rpcCancel()
+
+		client := pb.NewMatchMakingFunctionServiceClient(conn)
+		runStream, err := client.Run(rpcCtx)
+		if err != nil {
+			t.Fatalf("client.Run failed: %v", err)
+		}
+		if err := runStream.Send(&pb.ChunkedMmfRunRequest{
+			NumChunks: 1,
+			Profile:   &pb.Profile{Name: "p"},
+		}); err != nil {
+			t.Fatalf("runStream.Send failed: %v", err)
+		}
+
+		select {
+		case <-blocker.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for blocking Run handler to be entered")
+		}
+
+		cancelAt := time.Now()
+		srvCancel()
+
+		select {
+		case serveErr := <-errCh:
+			if serveErr != nil {
+				t.Fatalf("StartServerWithContext returned unexpected error: %v", serveErr)
+			}
+			elapsed := time.Since(cancelAt)
+			if elapsed < 5*time.Second {
+				t.Fatalf("StartServerWithContext returned in %v, expected at least 5s graceful wait", elapsed)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("StartServerWithContext did not force-stop within 15s")
 		}
 	})
 }

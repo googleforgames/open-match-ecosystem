@@ -30,91 +30,167 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
+	"time"
 
 	pb "github.com/googleforgames/open-match2/v2/pkg/pb"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
-var (
-	logfields = logrus.Fields{
-		"app":       "matchmaker",
-		"component": "matchmaking_function",
-		"function":  "server",
-	}
-	log    = logrus.New()
-	logger = log.WithFields(logfields)
+const (
+	// maxMessageBytes is the soft limit on any single gRPC message in either
+	// direction. 4 MiB is gRPC's default maximum received message size, and
+	// some middleware layers that gRPC traffic passes through (proxies, service
+	// meshes, load balancers) enforce the same limit and silently discard
+	// larger messages. So rather than raising limits, everything in Open Match
+	// stays under it: om-core splits the profile it sends to an MMF into chunks
+	// that each fit (see GetChunkedRequest), and an MMF must keep every match
+	// it sends back under it too. The server sets it explicitly (it is also
+	// gRPC's default) so the limit is visible and does not change if gRPC's
+	// defaults do. The limit must never be raised.
+	maxMessageBytes = 4 * 1024 * 1024
+
+	// shutdownGracePeriod bounds how long shutdown waits for in-flight RPCs.
+	// GracefulStop waits for every in-flight Run to finish; a Run that never
+	// returns would block shutdown indefinitely, and Cloud Run sends SIGKILL
+	// about 10 seconds after SIGTERM, so in-flight streams get a bounded window
+	// and then whatever is left is force-closed.
+	shutdownGracePeriod = 8 * time.Second
+
+	// BackfillProfilePrefix starts the name of every backfill profile an MMF
+	// creates. Backfill profile names have the form
+	// "backfill.<base>.<unique-suffix>"; the game server director recognizes
+	// backfill profiles by this prefix.
+	BackfillProfilePrefix = "backfill."
 )
 
-// StartServer creates and starts the Match Function server
+// baseLogFields are added to every log line written by this package.
+var baseLogFields = logrus.Fields{
+	"app":       "matchmaker",
+	"component": "matchmaking_function",
+	"function":  "server",
+}
+
+// StartServer creates and starts the Match Function server and blocks until it
+// stops; see StartServerWithContext.
 func StartServer(port int32, mmfServer pb.MatchMakingFunctionServiceServer, l *logrus.Logger) error {
 	return StartServerWithContext(context.Background(), port, mmfServer, l)
 }
 
-// StartServerWithContext creates and starts the Match Function server and stops it gracefully when ctx is done.
+// StartServerWithContext creates and starts the Match Function server and
+// blocks until it stops. When ctx is done, the server stops accepting new
+// streams and gives in-flight Run calls up to the graceful stop timeout to
+// finish before closing them. If l is nil, a new default logrus.Logger is used.
+// Each call uses its own logger, so it is safe to start several servers in one
+// process (the example matchmaker runs fifo and debug MMFs in-process).
 func StartServerWithContext(ctx context.Context, port int32, mmfServer pb.MatchMakingFunctionServiceServer, l *logrus.Logger) error {
-	var err error
-	if l != nil {
-		log = l
-		logger = log.WithFields(logfields)
+	if l == nil {
+		l = logrus.New()
 	}
+	srvLog := l.WithFields(baseLogFields).WithField("port", port)
 
 	// Create and host a new gRPC service on the requested port.
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		logger.Errorf("TCP net listener initialization failed for port %v, got %s", port, err.Error())
+		srvLog.Errorf("TCP net listener initialization failed for port %v, got %s", port, err.Error())
 		return err
 	}
 
-	logger.Infof("MMF gRPC Server starting on TCP port %v ", port)
-	var opts []grpc.ServerOption
-	server := grpc.NewServer(opts...)
-	pb.RegisterMatchMakingFunctionServiceServer(server, mmfServer)
+	srvLog.Infof("MMF gRPC Server starting on TCP port %v", port)
+	grpcSrv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxMessageBytes),
+		grpc.MaxSendMsgSize(maxMessageBytes),
+	)
+	pb.RegisterMatchMakingFunctionServiceServer(grpcSrv, mmfServer)
 
-	done := make(chan struct{})
-	defer close(done)
+	serveDone := make(chan struct{})
+	defer close(serveDone)
 	go func() {
 		select {
 		case <-ctx.Done():
-			logger.Infof("Shutting down MMF gRPC Server gracefully")
-			server.GracefulStop()
-		case <-done:
+			srvLog.Infof("Shutting down MMF gRPC Server gracefully (timeout %s)", shutdownGracePeriod)
+			stopped := make(chan struct{})
+			go func() {
+				grpcSrv.GracefulStop()
+				close(stopped)
+			}()
+			timer := time.NewTimer(shutdownGracePeriod)
+			defer timer.Stop()
+			select {
+			case <-stopped:
+			case <-timer.C:
+				srvLog.Warnf("MMF gRPC Server did not stop within %s; closing remaining streams", shutdownGracePeriod)
+				grpcSrv.Stop()
+			}
+		case <-serveDone:
 		}
 	}()
 
-	if err = server.Serve(ln); err != nil {
-		logger.Errorf("gRPC serve failed, got %s", err.Error())
+	// Serve returns nil once GracefulStop or Stop has been called.
+	if err := grpcSrv.Serve(ln); err != nil {
+		srvLog.Errorf("gRPC serve failed, got %s", err.Error())
 		return err
 	}
 
 	return nil
 }
 
-// GetChunkedRequest receives a MMF Server request stream sending partial
-// 'chunks' of a profile and re-assembles it. A profiles is 'chunked' when it
-// its pools contain enough participating tickets that it exceeds the 4MB
-// default max size of a protobuf message. Each 'chunk' contains the complete
-// profile and a portion of the tickets participating in the profile's pools.
-func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Profile, error) {
-	// Infinite loop that breaks on stream close (err == io.EOF) or after receiving
-	// the number of chunks specified in the pb.ChunkedMmfRunRequest message
-	var req *pb.Profile
-	pools := make(map[string]*pb.Pool)
-	for i := int32(1); i >= 0; i++ {
+// BaseProfileName returns the stable part of a profile name, suitable for
+// building match IDs and backfill profile names whose prefix (everything before
+// the last dot) has bounded cardinality. By convention profile names use
+// reverse-DNS notation with the unique part (timestamp, counter, etc.) after
+// the last dot; for example, the director names its profiles
+// "dev.open-match.<fleet>.<mode>.<unix-nanos>". BaseProfileName strips that
+// last segment and one leading BackfillProfilePrefix, so a backfill of a
+// backfill does not keep growing its name:
+//   - "dev.open-match.fleet.mode.1730000000" -> "dev.open-match.fleet.mode"
+//   - "backfill.dev.open-match.fleet.mode.1730000-3" -> "dev.open-match.fleet.mode"
+//   - "my-profile" -> "my-profile"
+func BaseProfileName(name string) string {
+	trimmed := strings.TrimPrefix(name, BackfillProfilePrefix)
+	if lastDot := strings.LastIndexByte(trimmed, '.'); lastDot > 0 {
+		return trimmed[:lastDot]
+	}
+	return trimmed
+}
 
+// GetChunkedRequest receives an MMF server request stream sending partial
+// chunks of a profile and reassembles it.
+//
+// Why chunks exist: every gRPC message in Open Match must stay under the 4 MiB
+// soft limit; that is gRPC's default maximum message size, and some middleware
+// silently discards larger messages, so the limit cannot simply be raised. A
+// profile whose pools hold many tickets can be far larger than 4 MiB, so
+// om-core splits it into several ChunkedMmfRunRequest messages, each sized from
+// the actual serialized protobuf to fit under the limit, and streams them to
+// the MMF. Each chunk contains the complete profile except for the pools'
+// tickets, plus a portion of those tickets; this function concatenates the
+// tickets from every chunk to rebuild the full pools.
+//
+// It returns once all chunks have arrived; if the stream fails before then it
+// returns the error and discards any chunks already received, so the MMF never
+// runs against an incomplete set of tickets. The caller passes in its own
+// logger (typically the MMF's logger) so the helper's debug output carries the
+// MMF's log fields.
+func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer, logger *logrus.Entry) (*pb.Profile, error) {
+	// Loop until the number of chunks specified in the ChunkedMmfRunRequest has
+	// been received, or the stream returns an error (including io.EOF if
+	// om-core closes it early).
+	pools := make(map[string]*pb.Pool)
+	for chunkNum := int32(1); ; chunkNum++ {
 		// Recv() returns a pb.ChunkedMmfRunRequest, which contains:
 		// - A full copy of the profile /except/ the pools.
 		//   - A portion of the pools with some of the participating tickets
 		// - The total number of chunks for this request. Chunks are unordered.
 		in, err := stream.Recv()
 		if err != nil {
-			// TODO: Check if we got any portion of a valid profile, if so, attempt a run
 			return nil, err
 		}
 
-		logger.Debugf("Processing chunk %02d/%02d", i, in.GetNumChunks())
+		logger.Debugf("Processing chunk %02d/%02d", chunkNum, in.GetNumChunks())
 		for name, pool := range in.GetProfile().GetPools() {
-			logger.Debugf("concatinating pool %v", name)
+			logger.Debugf("concatenating pool %v", name)
 			if _, ok := pools[name]; !ok {
 				rosterName := pool.GetParticipants().GetName()
 				if rosterName == "" {
@@ -139,7 +215,7 @@ func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Prof
 					},
 				}
 			} else {
-				// concate pools split amoung multiple chunks
+				// concatenate pools split among multiple chunks
 				if pools[name].Participants == nil {
 					rosterName := pool.GetParticipants().GetName()
 					if rosterName == "" {
@@ -154,24 +230,21 @@ func GetChunkedRequest(stream pb.MatchMakingFunctionService_RunServer) (*pb.Prof
 			}
 		}
 
-		// NOTE: Haven't found a case yet where this doesn't get all chunks,
-		// BUT it was designed so that you can go ahead and run your MMF with
-		// the chunks you received, even if you didn't get them all. This could
-		// be made more robust by making this condition fire on either
-		// receiving all the chunks (i.e. what it does now) /or/ when a timeout
-		// is reached.
-		if in.GetNumChunks() == i {
+		// om-core sends every chunk before it starts reading matches, so in
+		// practice this always receives them all; if you would rather run with
+		// a partial profile than fail (for example after a timeout), this is
+		// where you would add that condition.
+		if chunkNum >= in.GetNumChunks() {
 			// Read the rest of the request profile from the last chunk.
 			// (All chunks contain only a portion of the pools, but a
 			// complete copy of everything else in the profile.)
-			req = &pb.Profile{
+			req := &pb.Profile{
 				Name:       in.GetProfile().GetName(),
 				Pools:      pools,
 				Extensions: in.GetProfile().GetExtensions(),
 			}
-			logger.Debugf("Finished receiving %v chunks of MMF profile %v", in.GetProfile().GetName(), i)
-			break
+			logger.Debugf("Finished receiving %v chunks of MMF profile %v", chunkNum, in.GetProfile().GetName())
+			return req, nil
 		}
 	}
-	return req, nil
 }

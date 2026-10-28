@@ -14,17 +14,19 @@
 
 // This sample is a reference to demonstrate serving a golang matchmaking
 // function using gRPC, and can be used as a starting point for your match
-// function.  This sample uses the 'fifo' matching function to create 1v1
-// matches, using a first-in-first-out (FIFO) strategy.
+// function. By default it serves the 'fifo' matching function, which makes
+// matches using a first-in-first-out (FIFO) strategy, with the number and size
+// of rosters coming from the profile's extensions (see functions/fifo); setting
+// MMF_FUNCTION to "debug" serves the debug function instead.
 //
 // A typical approach if you wish to write your mmf in golang would be to make
 // a copy of the open-match.dev/open-match-ecosystem/v2/mmf/functions/fifo
 // directory, write your own matchmaking logic in the 'Run' function based on
-// your game's requirements, rename the module it according to what it does,
+// your game's requirements, rename the module according to what it does,
 // and then compile this main program using your function in place of fifo.
 //
 // A typical production deployment would put that compiled binary into a
-// continer image to serve from a serverless platform like Cloud Run or
+// container image to serve from a serverless platform like Cloud Run or
 // kNative, or a kubernetes deployment with a service in front of it.
 package main
 
@@ -59,14 +61,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// Init viper config with default port
+	// Init viper config with default port.
+	// Cloud Run and the GKE manifest set PORT explicitly; the 50090 default is
+	// for local runs: it avoids om-core's default port (8080) and matches the
+	// standalone gsdirector's default SOLODUEL_PORT, so the two find each other
+	// with no config.
 	cfg := viper.New()
-	cfg.SetDefault("PORT", 8080)
+	cfg.SetDefault("PORT", 50090)
 	cfg.SetDefault("MMF_FUNCTION", "fifo")
 
 	// Override these with env vars when doing local development.
-	// Suggested values in that case are "text", "debug", and "false",
-	// respectively
+	// Suggested values in that case are "text", "debug", and "true",
+	// respectively (LOG_CALLER set to "true" adds the calling file and line
+	// number to every log line).
 	cfg.SetDefault("LOGGING_FORMAT", "json")
 	cfg.SetDefault("LOGGING_LEVEL", "info")
 	cfg.SetDefault("LOG_CALLER", "false")
