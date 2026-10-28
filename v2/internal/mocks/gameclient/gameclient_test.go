@@ -16,6 +16,7 @@ package gameclient
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -31,22 +32,34 @@ func TestSimple(t *testing.T) {
 			t.Fatalf("iteration %d: expected non-nil ticket attributes", i)
 		}
 
-		crTime := attrs.GetCreationTime()
-		if crTime == nil || !crTime.IsValid() || crTime.AsTime().IsZero() {
-			t.Fatalf("iteration %d: invalid CreationTime: %v", i, crTime)
+		// The matchmaking queue, not the client, sets CreationTime, and no pool uses tags.
+		if crTime := attrs.GetCreationTime(); crTime != nil {
+			t.Fatalf("iteration %d: got CreationTime %v, want nil", i, crTime)
 		}
 
-		tags := attrs.GetTags()
-		if len(tags) != 1 || tags[0] == "" {
-			t.Fatalf("iteration %d: got tags %v, want 1 non-empty tag", i, tags)
+		if tags := attrs.GetTags(); len(tags) != 0 {
+			t.Fatalf("iteration %d: got tags %v, want empty", i, tags)
 		}
 
-		ping, ok := attrs.GetDoubleArgs()["ping.asia-northeast1-a"]
+		doubleArgs := attrs.GetDoubleArgs()
+		mmr, ok := doubleArgs["mmr"]
 		if !ok {
-			t.Fatalf("iteration %d: missing ping.asia-northeast1-a in DoubleArgs", i)
+			t.Fatalf("iteration %d: missing mmr in DoubleArgs", i)
 		}
-		if ping < 20 || ping >= 120 {
-			t.Fatalf("iteration %d: got ping %v, want in [20, 120)", i, ping)
+		if mmr < 500 || mmr > 2750 {
+			t.Fatalf("iteration %d: got mmr %v, want in [500, 2750]", i, mmr)
+		}
+
+		const pingPrefix = "ping."
+		hasValidZonePing := false
+		for key, val := range doubleArgs {
+			if strings.HasPrefix(key, pingPrefix) && len(key) > len(pingPrefix) && val >= 20 && val <= 100 {
+				hasValidZonePing = true
+				break
+			}
+		}
+		if !hasValidZonePing {
+			t.Fatalf("iteration %d: expected at least one ping.<zone> in [20, 100], got DoubleArgs %v", i, doubleArgs)
 		}
 
 		class, ok := attrs.GetStringArgs()["class"]
