@@ -22,6 +22,7 @@ package extensions
 
 import (
 	"errors"
+	"maps"
 
 	"github.com/googleforgames/open-match2/v2/pkg/pb"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -32,16 +33,17 @@ var (
 	NoSuchKeyError = errors.New("Extension field contains no such key")
 )
 
-// Combine concatinates two map[string]*anypb.Any maps. If the two maps contain
-// values at the same key, the value in map 'b' takes precedent.
+// Combine returns a new map holding the entries of both a and b. On a shared
+// key, the value in b takes precedence. Neither input map is modified, and
+// either may be nil. The anypb.Any values themselves are shared, not copied.
 func Combine(a map[string]*anypb.Any, b map[string]*anypb.Any) map[string]*anypb.Any {
-	for k, v := range b {
-		a[k] = v
-	}
-	return a
+	combined := make(map[string]*anypb.Any, len(a)+len(b))
+	maps.Copy(combined, a)
+	maps.Copy(combined, b)
+	return combined
 }
 
-// String() is a simple helper function to retrieve the string stored in the
+// String is a simple helper function to retrieve the string stored in the
 // extensions field at the provided key, and return it as a standard golang string value.
 func String(ex map[string]*anypb.Any, exKey string) (out string, err error) {
 	stringPb := &knownpb.StringValue{}
@@ -55,7 +57,7 @@ func String(ex map[string]*anypb.Any, exKey string) (out string, err error) {
 	return "", NoSuchKeyError
 }
 
-// Bool() is a simple helper function to retrieve the bool stored in the
+// Bool is a simple helper function to retrieve the bool stored in the
 // extensions field at the provided key, and return it as a standard golang bool value.
 func Bool(ex map[string]*anypb.Any, exKey string) (out bool, err error) {
 	boolPb := &knownpb.BoolValue{}
@@ -69,7 +71,7 @@ func Bool(ex map[string]*anypb.Any, exKey string) (out bool, err error) {
 	return false, NoSuchKeyError
 }
 
-// Int32() is a simple helper function to retrieve the int32 stored in the
+// Int32 is a simple helper function to retrieve the int32 stored in the
 // extensions field at the provided key, and return it as a standard golang int value.
 func Int32(ex map[string]*anypb.Any, exKey string) (out int, err error) {
 	int32Pb := &knownpb.Int32Value{}
@@ -83,9 +85,10 @@ func Int32(ex map[string]*anypb.Any, exKey string) (out int, err error) {
 	return 0, NoSuchKeyError
 }
 
-// MMFRequests is a simple helper function to extract an array of matchmaking
-// requests from the extensions field of an OM2 protobuf message. If no MmfRequest
-// exists at the given key, it will return a nil value and extensions.NoSuchKeyError.
+// MMFRequest is a simple helper function to extract a single matchmaking
+// request (a pb.MmfRequest) from the extensions field of an OM2 protobuf
+// message. If no MmfRequest exists at the given key, it returns nil and
+// extensions.NoSuchKeyError.
 func MMFRequest(ex map[string]*anypb.Any, exKey string) (*pb.MmfRequest, error) {
 	var err error
 	out := &pb.MmfRequest{}
@@ -101,8 +104,8 @@ func MMFRequest(ex map[string]*anypb.Any, exKey string) (*pb.MmfRequest, error) 
 	return nil, NoSuchKeyError
 }
 
-// AnypbIntMap() takes a golang map[string]int32 and creates an identical map
-// of 'any' protobuf messages, suitable to send in the extensions field of a
+// AnypbIntMap takes a golang map[string]int32 and creates an identical map
+// of 'any' protobuf messages, suitable to send in the extensions field of an
 // Open Match protobuf message.
 func AnypbIntMap(in map[string]int32) map[string]*anypb.Any {
 	out := make(map[string]*anypb.Any)

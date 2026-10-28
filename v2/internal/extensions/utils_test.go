@@ -100,3 +100,80 @@ func TestBool(t *testing.T) {
 		}
 	})
 }
+
+func TestCombine(t *testing.T) {
+	oneAny, err := anypb.New(wrapperspb.Int32(1))
+	if err != nil {
+		t.Fatalf("failed to pack wrapperspb.Int32(1): %v", err)
+	}
+	twoAny, err := anypb.New(wrapperspb.Int32(2))
+	if err != nil {
+		t.Fatalf("failed to pack wrapperspb.Int32(2): %v", err)
+	}
+
+	t.Run("b wins on conflicts and inputs are not mutated", func(t *testing.T) {
+		a := map[string]*anypb.Any{
+			"shared": oneAny,
+			"onlyA":  oneAny,
+		}
+		b := map[string]*anypb.Any{
+			"shared": twoAny,
+			"onlyB":  twoAny,
+		}
+
+		got := Combine(a, b)
+		if len(got) != 3 {
+			t.Fatalf("len(got) = %d, want 3", len(got))
+		}
+		if got["shared"] != twoAny {
+			t.Errorf("got[\"shared\"] = %p, want %p", got["shared"], twoAny)
+		}
+		if got["onlyA"] != oneAny {
+			t.Errorf("got[\"onlyA\"] = %p, want %p", got["onlyA"], oneAny)
+		}
+		if got["onlyB"] != twoAny {
+			t.Errorf("got[\"onlyB\"] = %p, want %p", got["onlyB"], twoAny)
+		}
+
+		if len(a) != 2 {
+			t.Errorf("len(a) = %d, want 2", len(a))
+		}
+		if a["shared"] != oneAny {
+			t.Errorf("a[\"shared\"] = %p, want %p", a["shared"], oneAny)
+		}
+		if len(b) != 2 {
+			t.Errorf("len(b) = %d, want 2", len(b))
+		}
+
+		got["new"] = twoAny
+		if _, ok := a["new"]; ok {
+			t.Error("writing to result mutated input map a")
+		}
+	})
+
+	t.Run("nil inputs", func(t *testing.T) {
+		bothNil := Combine(nil, nil)
+		if bothNil == nil {
+			t.Fatal("Combine(nil, nil) = nil, want non-nil empty map")
+		}
+		if len(bothNil) != 0 {
+			t.Errorf("len(Combine(nil, nil)) = %d, want 0", len(bothNil))
+		}
+
+		nilWithMap := Combine(nil, map[string]*anypb.Any{"onlyB": twoAny})
+		if len(nilWithMap) != 1 {
+			t.Errorf("len(Combine(nil, oneEntry)) = %d, want 1", len(nilWithMap))
+		}
+		if nilWithMap["onlyB"] != twoAny {
+			t.Errorf("nilWithMap[\"onlyB\"] = %p, want %p", nilWithMap["onlyB"], twoAny)
+		}
+
+		mapWithNil := Combine(map[string]*anypb.Any{"onlyA": oneAny}, nil)
+		if len(mapWithNil) != 1 {
+			t.Errorf("len(Combine(oneEntry, nil)) = %d, want 1", len(mapWithNil))
+		}
+		if mapWithNil["onlyA"] != oneAny {
+			t.Errorf("mapWithNil[\"onlyA\"] = %p, want %p", mapWithNil["onlyA"], oneAny)
+		}
+	})
+}
