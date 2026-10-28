@@ -16,23 +16,30 @@ The sample is a Go application designed to be built using [CNCF Buildpacks](http
 
 [`main.go`](main.go) bundles two sample Matchmaking Function strategies into a single binary and selects which one to serve at startup based on the `MMF_FUNCTION` environment variable (case-insensitive, whitespace-trimmed; defaults to `fifo`):
 
-* **`MMF_FUNCTION=fifo`** (default, or empty `""`): Runs the first-in-first-out matchmaking implementation in [`functions/fifo/fifo.go`](functions/fifo/fifo.go). It reconstructs chunked `Profile` messages, deduplicates tickets across pools, builds matches with `desiredNumRosters` rosters of up to `desiredRosterLen` tickets (or partial matches down to `minRosterLen` with a `"backfill."` `MmfRequest` attached to `Match.Extensions`), and streams `StreamedMmfResponse` messages back to `om-core`.
-* **`MMF_FUNCTION=debug`**: Runs the diagnostic profile inspection implementation in [`functions/debug/debug.go`](functions/debug/debug.go). Instead of matching tickets, it logs the received `Profile` name, extensions, and pool filter definitions/ticket counts, and returns a single empty `Match` (with zero rosters/tickets and `score = math.MinInt32`) so `om-core` skips ticket deactivation while verifying end-to-end MMF connectivity.
+* **`MMF_FUNCTION=fifo`** (default, or empty `""`): Runs the first-in-first-out matchmaking implementation in [`functions/fifo/fifo.go`](functions/fifo/fifo.go). It reconstructs chunked `Profile` messages, deduplicates tickets across pools, sorts tickets oldest-first by creation time (`om-core` guarantees no order for pool contents), builds matches with `desiredNumRosters` rosters of up to `desiredRosterLen` tickets (or partial matches down to `minRosterLen` with a backfill `MmfRequest` attached to `Match.Extensions`), stops after the number of matches given by the extension `open-match.dev/agones-game-server-ready-count` (`extensions.AgonesGSReadyCountKey`, set by the director to the number of ready servers that can take matches from this profile, with no limit when absent), and streams `StreamedMmfResponse` messages back to `om-core`.
+* **`MMF_FUNCTION=debug`**: Runs the diagnostic profile inspection implementation in [`functions/debug/debug.go`](functions/debug/debug.go). Instead of matching tickets, it logs the received `Profile` name, extensions, and pool filter definitions/ticket counts, and returns a single `Match` with no rosters whose extensions carry its analysis (`debug.pool-ticket-count/` followed by the pool's key in the request profile's `Pools` map for each pool, plus `mmfName`, `profileName`, and the profile's own extensions). `om-core` forwards ticketless matches to the director without deactivating anything; the director should treat a ticketless match as feedback, never as a proposal to allocate a server for.
 * Passing any other value for `MMF_FUNCTION` causes the process to exit on startup with `unknown MMF_FUNCTION "<value>" (expected 'fifo' or 'debug')`.
 
 ### Environment Variables
 
 | Environment Variable | Default | Description |
 | :--- | :--- | :--- |
-| `PORT` | `8080` | TCP port on which the MMF gRPC server listens. |
+| `PORT` | `50090` | TCP port on which the MMF gRPC server listens. Cloud Run sets `PORT` automatically (`8080` with [`deploy/cloudbuild.yaml`](deploy/cloudbuild.yaml)) and the GKE manifest ([`../../deploy_on_gke/mmf.yaml`](../../deploy_on_gke/mmf.yaml)) sets `8080` explicitly; the `50090` local default avoids `om-core`'s default `8080` and matches the standalone director's default `SOLODUEL_PORT` (while the all-in-one `matchmaker` runs its MMFs in-process on `SOLODUEL_PORT` and `DEBUGMMF_PORT`). |
 | `MMF_FUNCTION` | `"fifo"` | MMF strategy to serve (`"fifo"` or `"debug"`). |
 | `LOGGING_FORMAT` | `"json"` | Log output format (`"json"` for Cloud Logging or `"text"` for local development). |
 | `LOGGING_LEVEL` | `"info"` | Minimum log level (`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`, `"fatal"`). |
 | `LOG_CALLER` | `"false"` | When `"true"`, includes calling file and line number in log output. |
 
+To run the MMF locally from `v2/` (listens on `50090` by default):
+
+```bash
+cd <repo>/v2
+LOGGING_FORMAT=text LOGGING_LEVEL=debug go run ./examples/mmf
+```
+
 ## Build
 
-We test builds [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds). Because `go.mod` and `internal/` live in `v2/`, the build must be started from the `v2/` directory.
+We test builds [remotely using Cloud Build on Google Cloud](https://cloud.google.com/docs/buildpacks/build-application#remote_builds). Because `go.mod` and `internal/` live in `v2/`, the build must be started from the `v2/` directory. Builds use the committed `go.mod` and `go.sum` without updating dependencies before submitting so the built image matches what was tested.
 
 You can build using [`v2/cloudbuild.yaml`](../../cloudbuild.yaml):
 
@@ -49,8 +56,8 @@ Or build directly with `gcloud builds submit --pack`:
 ```bash
 cd <repo>/v2
 
-# Update dependencies to the latest versions and kick off a Cloud Build
-go get -u && go mod tidy && gcloud builds submit --async --pack \
+# Build from the committed go.mod and go.sum and kick off a Cloud Build
+gcloud builds submit --async --pack \
   image=$(gcloud config get artifacts/location)-docker.pkg.dev/$(gcloud config get project)/open-match/soloduel,env=GOOGLE_BUILDABLE=./examples/mmf
 ```
 
@@ -58,7 +65,11 @@ This application can also be built locally with the [`pack`](https://buildpacks.
 
 ## Deploy
 
-The [`deploy/cloudbuild.yaml`](deploy/cloudbuild.yaml) file (`v2/examples/mmf/deploy/cloudbuild.yaml`) deploys the MMF container image alongside an `opentelemetry-collector` sidecar container to Google Cloud Run (with `--use-http2` enabled for streaming gRPC, `--execution-environment=gen2`, and `--no-cpu-throttling`). Because the same container image supports both `fifo` and `debug`, you can deploy multiple Cloud Run services from a single built image by varying `_JOB_NAME` and `_MMF_FUNCTION`:
+The [`deploy/cloudbuild.yaml`](deploy/cloudbuild.yaml) file (`v2/examples/mmf/deploy/cloudbuild.yaml`) deploys only the MMF container to Google Cloud Run with HTTP/2 (`--use-http2`) for streaming gRPC, the 2nd generation execution environment (`--execution-environment=gen2`), no CPU throttling (`--no-cpu-throttling`), `--min-instances=1` (keeping one warm instance to avoid a cold start on the first matchmaking cycle after a quiet period), and `--timeout=3600` (each `InvokeMatchmakingFunctions` call holds one streaming request open for as long as the MMF runs, and Cloud Run's default 300s request timeout is shorter than `om-core`'s `OM_MMF_TIMEOUT_SECS` default of 600s, so without raising it Cloud Run would cut long MMF streams before `om-core` does; 3600s is Cloud Run's maximum while `om-core`'s deadline still applies).
+
+No OpenTelemetry Collector sidecar is deployed because the sample MMF emits no metrics. If you are updating a Cloud Run service previously deployed with an older manifest that included the `opentelemetry-collector` sidecar container, you can remove that old sidecar with a Cloud Run service update (for example, `gcloud run services update <service> --region=${REGION} --remove-containers=opentelemetry-collector`).
+
+Because the same container image supports both `fifo` and `debug`, you can deploy multiple Cloud Run services from a single built image by varying `_JOB_NAME` and `_MMF_FUNCTION`:
 
 ```bash
 cd <repo>/v2/examples/mmf/deploy
@@ -79,9 +90,8 @@ gcloud builds submit --async --no-source \
 | `_JOB_NAME` | `soloduel` | Cloud Run service name to deploy. |
 | `_REGION` | `us-central1` | Google Cloud region for Cloud Run and Artifact Registry. |
 | `_SERVICE_ACCOUNT` | `soloduel-identity` | IAM service account used by the deployed MMF Cloud Run service. |
-| `_ARTIFACT_REGISTRY_REPO` | `open-match-2-Test` | Artifact Registry repository name in `${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}`. |
-| `_MMF_IMAGE_NAME` | `om-FIFO-mmf:0.0.1` | MMF container image name and tag. |
-| `_OTEL_SIDECAR_IMAGE` | `otel-collector-sidecar` | OpenTelemetry Collector sidecar image name and tag. |
+| `_ARTIFACT_REGISTRY_REPO` | `open-match` | Artifact Registry repository name in `${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}` (must be lowercase). |
+| `_MMF_IMAGE_NAME` | `soloduel:latest` | MMF container image name and tag (must be lowercase). |
 | `_MMF_FUNCTION` | `fifo` | Sets the `MMF_FUNCTION` environment variable (`fifo` or `debug`) on the `mmf` container. |
 | `_LOGGING_LEVEL` | `info` | Sets the `LOGGING_LEVEL` environment variable on the `mmf` container. |
 
@@ -97,8 +107,8 @@ A typical approach is to consider your matching logic in your MMF as a matching 
 > [!WARNING]
 > Be aware that OM2 makes no effort to prevent individual concurrent MMF invocations from returning matches containing the same ticket (ticket 'collision'). Your matchmaker should be coded to avoid or remediate collisions.
 
-* The Open Match `Profile` protobuf message containing `Pools` filled with `Tickets` may exceed the default protobuf message size limit of 4MB. OM respects this limit (as some middlewares do not support higher limits), and will 'chunk' these `Profiles` into multiple messages, streamed to your MMF. MMFs SHOULD read all streamed chunks sent to them by OM and concatenate all the `Pools` received in those 'chunks' (see `server.GetChunkedRequest(stream)` in [`server/server.go`](server/server.go)). Every 'chunk' contains all of the data in the `Profile` *except* for the `Profile`'s `Pools`, of which each 'chunk' gets a guaranteed-unique portion. This means your MMF MAY still perform matching even if it does not receive all 'chunks'.
-* MMF matching logic (i.e. the `Run()` function) MUST eventually exit of its own accord. Open Match will never cancel your MMF invocation; exiting is your MMF's responsibility.
+* Every gRPC message in Open Match stays under `4 MiB` (`4 * 1024 * 1024` bytes)—gRPC's default maximum message size, which some middleware (proxies, service meshes, load balancers) silently enforces. Rather than raising limits, Open Match stays under `4 MiB`: when a `Profile` with `Pools` full of `Tickets` exceeds the limit, `om-core` chunks the `Profile` into multiple `ChunkedMmfRunRequest` messages sized from the actual serialized protobuf and streams them to your MMF. Every chunk contains the complete `Profile` *except* for `Pools`, of which each chunk carries a unique portion of tickets. MMFs SHOULD read all streamed chunks and concatenate the `Pools` (see `server.GetChunkedRequest(stream, logger)` in [`server/server.go`](server/server.go), which takes the gRPC stream and a logger, and discards any partial profile if the stream fails before all chunks arrive). The sample server in [`server/server.go`](server/server.go) sets the `4 MiB` limit explicitly in both directions (`MaxRecvMsgSize` and `MaxSendMsgSize`), so returned `Match` messages must also stay under `4 MiB`.
+* MMF matching logic (i.e. the `Run()` function) MUST eventually exit of its own accord. `om-core` ignores the matchmaker cancelling its `InvokeMatchmakingFunctions` call, but enforces `OM_MMF_TIMEOUT_SECS` (default `600`s), after which it cancels the MMF stream; long-running MMFs SHOULD check `stream.Context()`, as `fifo` does between matches. On process shutdown, the sample server in [`server/server.go`](server/server.go) gives in-flight `Run` calls `8` seconds to finish and then closes them.
 * MMFs SHOULD stream back matches as they are made, when possible.
 * **Place ONLY valid ticket IDs into match rosters**:
   * Every `*pb.Ticket` added to `Match.Rosters[...].Tickets` MUST be a genuine ticket received in the streamed `Profile`'s `Pools` with its original, non-empty `om-core` ticket ID intact (and deduplicated if a ticket appears in multiple pools within the same profile, as demonstrated in [`functions/fifo/fifo.go`](functions/fifo/fifo.go)).
@@ -121,7 +131,8 @@ By convention:
   * Create and populate an extension field holding the name of the `Profile` used to make the match. The key for this field should be `profileName`.
   * Create and populate an extension field holding the name of the MMF used to make the match. The key for this field should be `mmfName`.
   * Create and populate an extension field containing the MMF's subjective evaluation of the match quality. The key for this field should be `score`. (See the below section "MMF considerations & common misconceptions" for more details.)
-* When generating a match ID string, MMFs SHOULD use [reverse-DNS notation](https://en.wikipedia.org/wiki/Reverse_domain_name_notation) by convention. Put any frequently changing portions of the match ID (timestamps, match counter, etc.) between the last dot and the end of the ID string. This is to allow for recording a match ID as a metric attribute - everything after the last dot can be truncated and metrics can then still be meaningfully aggregated per MMF across multiple invocations by multiple profiles. For more information, search for 'high cardinality metrics'. See how the example does it in [`functions/fifo/fifo.go`](functions/fifo/fifo.go).
+* When generating a match ID string, match IDs MUST be unique and MMFs SHOULD use [reverse-DNS notation](https://en.wikipedia.org/wiki/Reverse_domain_name_notation) by convention, putting all dynamic portions (timestamps, match counter, etc.) in the final segment after the last dot—and that dynamic last segment MUST contain no dots itself. Truncating everything after the last dot then yields a bounded-cardinality prefix suitable for recording as a metric attribute across invocations and profiles (search for "high cardinality metrics" for background). The sample MMFs format match IDs as `<mmfName>.<base>.<suffix>` (where `<base>` is the incoming profile name without its own unique last segment or leading `"backfill."` prefix; see `server.BaseProfileName` in [`server/server.go`](server/server.go)), and [`functions/fifo/fifo.go`](functions/fifo/fifo.go) names its backfill profiles `backfill.<base>.<suffix>`.
+* When [`functions/fifo/fifo.go`](functions/fifo/fifo.go) builds a backfill `Profile` for a partially filled match, it asks for a single roster (`desiredNumRosters = 1`) with all open slots summed across rosters (`desiredRosterLen`), so uneven rosters never over-request players; team placement of backfilled players is left to the game server.
 
 ## MMF considerations & common misconceptions
 

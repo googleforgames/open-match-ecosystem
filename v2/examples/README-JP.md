@@ -11,13 +11,13 @@ GitHubレポ: [https://github.com/googleforgames/open-match-ecosystem/tree/main/
 
 **1. アプリケーション (`examples/` ディレクトリ):**
 
-* **[matchmaker](matchmaker/README.md)**: すべてのコンポーネントを単一のプロセスで実行する開発およびテスト用のハーネスです。メモリ内の `mmqueue`、`gsdirector`、およびローカルのマッチメイキング機能（MMF）サーバー（`fifo` と `debug`）を初期化するため、複数のサービスをデプロイすることなくローカル開発を行うのに理想的です。
-* **[standalone/mmqueue](standalone/mmqueue) (マッチメイキングキュー):** ゲームクライアント向けのフロントエンドサービスです。
+* **[matchmaker](matchmaker/README.md)**: すべてのコンポーネントを単一のプロセスで実行する開発およびテスト用のハーネスです。メモリ内の `mmqueue`、`gsdirector`、およびローカルのマッチメイキング機能（MMF）サーバー（`fifo`、およびオプトインした場合は `debug`）を初期化するため、複数のサービスをデプロイすることなくローカル開発を行うのに理想的です。
+* **[standalone/mmqueue](standalone/mmqueue/README.md) (マッチメイキングキュー):** ゲームクライアント向けのフロントエンドサービスです。
   * **機能:** クライアントからのマッチメイキングリクエストを受け取り、Open Matchの `Ticket` protobufを作成し、`omclient` を介して `om-core` での作成と有効化のためにキューに入れます。また、Directorから最終的なゲームサーバーのアサインメントを受け取り、クライアントに返します。
-* **[standalone/gsdirector](standalone/gsdirector) (ゲームサーバーDirector):** ゲームサーバーマネージャーとのマッチメイキングプロセスを調整するバックエンドサービスです。
+* **[standalone/gsdirector](standalone/gsdirector/README.md) (ゲームサーバーDirector):** ゲームサーバーマネージャーとのマッチメイキングプロセスを調整するバックエンドサービスです。
   * **機能:** ゲームサーバーマネージャー（この例ではモックのAgonesインテグレーション）にクエリを送信し、どのような種類のマッチが必要かを判断します。次に `Profile` オブジェクトを構築し、`om-core` の `InvokeMatchmakingFunctions` エンドポイントを呼び出します。`Match` の提案を受け取った後、それらを評価し、承認されたマッチにゲームサーバーを割り当て、接続詳細を `mmqueue` に送信します。
 * **[mmf](mmf/README.md) (マッチメイキング機能):** カスタムのゲーム固有のマッチングロジックを含む、スタンドアロンのgRPCサーバーです。
-  * **機能:** `om-core` はこのサービスの `Run` メソッドを呼び出し、フィルタリングされたチケットのプールを含む `Profile` をストリーミングします。MMFは自身のロジック（例：提供されている `fifo` 関数は単純な先入れ先出しのマッチを作成し、`debug` 関数は受信したプロファイルとプールをログ出力）を実行し、`Match` の提案をストリームで返します。
+  * **機能:** `om-core` はこのサービスの `Run` メソッドを呼び出し、フィルタリングされたチケットのプールを含む `Profile` をストリーミングします。MMFは自身のロジック（例：提供されている `fifo` 関数は単純な先入れ先出しのマッチを作成し、`debug` 関数は受信したプロファイルとプールをログ出力した上で、プールごとのチケット数をDirectorへのフィードバックとして格納したチケットなしマッチを返します）を実行し、`Match` の提案をストリームで返します。
 
 **2. 共有ロジック (`internal/` ディレクトリ):**
 
@@ -69,6 +69,10 @@ Open Match v2サンプルマッチメーカーの設計は、3つの主要な情
   * 次に、`om-core` は適切な**マッチメイキング機能 (`mmf`)** を呼び出し、フィルタリングされたプレイヤーのプールをストリーミングします。
   * `mmf` はゲーム固有のロジックを実行し、`Match` の提案をストリームで返します。
   * 最後に、`gsdirector` はこれらの提案を受け取り、最終検証を行い、承認された各マッチに特定の準備完了状態のゲームサーバーを割り当て、プレイヤーからサーバーへのアサインメントを完了させます。([`v2/internal/gsdirector/gsdirector.go`](../internal/gsdirector/gsdirector.go))
+* **`om-core` がDirectorに返すレスポンス**:
+  * `om-core` はすべてのMMFレスポンスを転送します。これには有効なチケットを含まないマッチ（`debug` MMFのプールごとのチケット数のように、MMFがフィードバックを返す用途に利用可能）やマッチを含まないレスポンスも含まれます。ロスター内のチケットIDのうち `om-core` が認識しなかったものは `Match.Extensions` の `invalid_ticket_ids` キーに列挙されます。Directorはチケットなしマッチをマッチ提案としてではなくフィードバックとして扱い、`gsdirector.mmf.feedback_responses` メトリクスにカウントします。
+  * いずれかのMMFが失敗した場合、`om-core` はまず受信済みのすべてのマッチをストリーム送信した後、`ErrorInfo` 詳細（reason `MMF_FAILURE`、メタデータ `mmf_name`、`grpc_code`、`message`）を失敗したMMFごとに1つ付与した `"N of M matchmaking functions failed: ..."` 形式のメッセージを持つgRPC `Internal` エラーで呼び出しを終了します。Directorは受信したマッチを保持しつつ、その失敗を `gsdirector.mmf.response.failures` に記録します。
+* **有効化バッチサイズ（Activation batch size）**: `mmqueue` および `gsdirector` の `OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL` は、`om-core` の `OM_MAX_STATE_UPDATES_PER_CALL`（デフォルト `500`）以下でなければなりません。これを超えると、`om-core` はすべての有効化呼び出しを拒否します。
 
 ### **高度なマッチメーカー操作：バックフィルとチケット衝突の処理**
 
@@ -80,7 +84,7 @@ Open Match v2サンプルマッチメーカーの設計は、3つの主要な情
 
 * **バックフィルリクエストの生成 (MMF内)**:
   * プロセスは [`v2/examples/mmf/functions/fifo/fifo.go`](mmf/functions/fifo/fifo.go) などのMMFで始まります。MMFがマッチを形成するものの、利用可能なチケットプールから全てのプレイヤースロットを埋めることができない場合、そのマッチを不完全と判断します。
-  * `om-core` にマッチ提案を返す前に、MMFは `Profile.Name` に `"backfill."` プレフィックス（`"backfill." + match.GetId()`）を付与した*新しい* `MmfRequest` を構築します。この新しいリクエストには、空のスロットを埋めるために必要な残りのプレイヤー数を見つけるために調整された新しい `Profile` が含まれています。
+  * `om-core` にマッチ提案を返す前に、MMFは `Profile.Name` を `"backfill."`、ベースプロファイル名、`.`、および一意のサフィックスを組み合わせた形式（`"backfill.<base>.<suffix>"`）にした*新しい* `MmfRequest` を構築します。サフィックス自体にドットを含めないことで、Directorは末尾を除去してカーディナリティが制限されたメトリクス属性を取得できます。この新しいリクエストには、空のスロットを埋めるために必要な残りのプレイヤー数を見つけるために調整された新しい `Profile` が含まれています。
   * この新しいバックフィル `MmfRequest` は、元の `Match` 提案の `Extensions` フィールドに `open-match.dev/mmf-request` キーとして添付されます。([`v2/examples/mmf/functions/fifo/fifo.go`](mmf/functions/fifo/fifo.go))
 * **バックフィルリクエストの処理 (Director内)**:
   * `gsdirector` はMMFからマッチ提案を受け取り、その `Extensions` を検査します。有効なバックフィルリクエスト（空でない `Profile.Name` を持つもの）が添付されている場合、このマッチをホストするゲームサーバーが後続サイクルでさらにプレイヤーを必要とすることを知ります。
@@ -95,13 +99,13 @@ Open Match 2は複数のMMFやプロファイルを並行して実行でき、�
 
 * **サイクル間衝突と同一サイクル内衝突の検出**:
   * **サイクル間の割り当て済みチケット追跡 (`assignments` マップ)**: `gsdirector` は、過去のサイクルで既にゲームサーバーが割り当てられアサインメントが送信されたすべてのチケットIDを記録する `assignments` マップ（エントリは `ASSIGNMENT_TTL_MS` 経過後に期限切れ）を維持します。提案されたマッチに `assignments` 内のチケットが含まれている場合（`numAssigned > 0`）、以前のサイクルで割り当てられたチケットが次のサイクル開始時点でまだ `om-core` インスタンスのローカルキャッシュ内でアクティブに見えていたことを意味します。このマッチは拒否され、`gsdirector.matchmaking_cycle.match.rejections.assigned` および `gsdirector.ticket.rejections.assigned` メトリクスに記録されます。
-  * **同一サイクル内の承認済みチケット追跡 (`acceptedTicketsThisCycle` マップ)**: 各マッチメイキングサイクル内で、`gsdirector` はサイクル固有の `acceptedTicketsThisCycle` マップも初期化します。`ProposalsLoop` でマッチ提案が検証を通過するたびに、そのマッチ内のすべてのチケットIDが `acceptedTicketsThisCycle` に登録されます（後続のサーバー割り当てが失敗した場合は削除されます）。同一サイクル内の後続のマッチ提案に `acceptedTicketsThisCycle` に既に存在するチケットが含まれている場合（`numSameCycleOverlap > 0`）、Directorは同一サイクル内のMMF・プロファイル重複（オーバーラップ）と判定してそのマッチを拒否します（この場合、`gsdirector.matchmaking_cycle.match.rejections` は増加しますが、`gsdirector.matchmaking_cycle.match.rejections.assigned` は増加しません）。
+  * **同一サイクル内の承認済みチケット追跡 (`acceptedTicketsThisCycle` マップ)**: 各マッチメイキングサイクル内で、`gsdirector` はサイクル固有の `acceptedTicketsThisCycle` マップも初期化します。サイクル内のマッチ提案に対する最初のパスで提案が検証を通過するたびに、そのマッチ内のすべてのチケットIDが `acceptedTicketsThisCycle` に登録されます。同一サイクル内の後続のマッチ提案に `acceptedTicketsThisCycle` に既に存在するチケットが含まれている場合（`numSameCycleOverlap > 0`）、Directorは同一サイクル内のMMF・プロファイル重複（オーバーラップ）と判定してそのマッチを拒否します（この場合、`gsdirector.matchmaking_cycle.match.rejections` は増加しますが、`gsdirector.matchmaking_cycle.match.rejections.assigned` は増加しません）。なお、フィードバックレスポンス（チケットなしマッチやマッチを含まないレスポンス）はマッチ提案として扱われることはありません。
 * **衝突解決時における `backfill.` 提案の優先化**:
   * `proposedMatches` は `"backfill."` で始まるプロファイル名の提案が先になるよう安定ソートされるため、バックフィルマッチが最初に `acceptedTicketsThisCycle` へチケットを登録します。同一サイクル内でバックフィルMMFと通常のMMFが同じプレイヤーを提案した場合、バックフィルマッチが優先的に承認され、競合した通常のマッチ提案が拒否されます。
-* **拒否されたマッチのチケット再有効化時における割り当て済み・承認済みチケットのスキップ**:
-  * マッチ提案が何らかの理由で拒否された場合、そのマッチに含まれる未割り当てのチケットは `om-core` の `ActivateTickets` エンドポイント（`rejectMatch` 関数）を介してアクティブなマッチメイキングプールに戻す必要があります。
-  * しかし、拒否されたマッチには、未割り当てのチケットだけでなく、過去のサイクルで既に割り当て済みのチケット（`assignments[tid]`）や、同一サイクル内の別のマッチで既に承認済みのチケット（`acceptedTicketsThisCycle[tid]`）が混在している場合があります。
-  * `rejectMatch` では、`if assignments[tid] || acceptedTicketsThisCycle[tid]` を明示的にチェックし、既に割り当て済みまたは同一サイクル内で承認済みのチケットIDを**スキップ**して、まだどのマッチにも確保されていないチケットID**のみ**を `ticketIdsToActivate` チャネルへ送ります。これにより、既に有効なマッチが確定したプレイヤーが誤って `om-core` で再有効化されることを防ぎます。
+* **先にすべての採否を決定し、未確保のチケットのみを再有効化する**:
+  * 同一サイクル内の複数の提案に同じチケットが含まれることがあるため（例：同じプールを共有するバックフィルプロファイルと通常プロファイル）、拒否されたマッチ内のチケットが、同一サイクルの後半で承認される別のマッチにも含まれている場合があります。
+  * そのため、Directorは2パスで処理を行います。**Pass 1**ではサイクル内のすべての提案に対して承認または拒否を決定し、**Pass 2**では拒否されたマッチのチケットを `om-core` の `ActivateTickets` エンドポイント経由で再有効化します。その際、承認されたマッチに含まれるチケット（`acceptedTicketsThisCycle`）、過去のサイクルで既に割り当て済みのチケット（`assignments`）、およびこのサイクルで既に再有効化キューに入ったチケット（`queuedForReactivationThisCycle` により重複排除し、各チケットの再有効化を高々1回に制限）をスキップします。
+  * その後、承認されたマッチに対するゲームサーバー割り当てが失敗した場合は、そのチケットを `acceptedTicketsThisCycle` から削除し、同じ手順で再有効化します。これにより、プレイヤーが割り当て済みでありながら同時に `om-core` 内でアクティブになる事態を防ぎます（提案ごとに都度再有効化するとまさにその状態が発生し、後続サイクルで誤った `assigned_tickets` 拒否を引き起こします）。
 
 #### **om-coreによる支援と、レプリケーション遅延とMMF重複の見分け方**
 
@@ -121,10 +125,10 @@ Open Match 2は複数のMMFやプロファイルを並行して実行でき、�
 | シナリオ | `gsdirector` / `mmqueue` メトリクス | `om_core` メトリクス | 診断結果と意味 |
 | :--- | :--- | :--- | :--- |
 | **1. サイクル間衝突（レプリケーション遅延）** | `gsdirector.matchmaking_cycle.match.rejections.assigned` > 0<br>`gsdirector.ticket.rejections.assigned` > 0 | `om_core.cache.replication.lag` の上昇（高いp95/p99）<br>`om_core.cache.incoming.backlog` / `om_core.cache.outgoing.backlog` > 0 | 前のサイクルで割り当てられたチケットの非有効化が、次のサイクル開始時までにすべての `om-core` インスタンスのローカルキャッシュへ伝播していなかったことを示します。 |
-| **2. 同一サイクル内衝突（並行MMFの重複）** | `gsdirector.matchmaking_cycle.match.rejections` > 0<br>`gsdirector.matchmaking_cycle.match.rejections.assigned` == 0<br>`gsdirector.matchmaking_cycle.match.deactivation_timeouts` == 0 | `om_core.cache.replication.lag` は低く健全<br>`om_core.mmf.deactivation.timeouts` == 0 | 同一サイクル内で並行実行された複数のMMFまたはプロファイルが同じチケットを選択し、Director内の `acceptedTicketsThisCycle` によってローカルで衝突が解決されたことを示します。 |
+| **2. 同一サイクル内衝突（並行MMFの重複）** | `gsdirector.matchmaking_cycle.match.rejections` がランダムドロップのベースライン（`gsdirector.matchmaking_cycle.match.proposals` の約 `RANDOM_MATCH_REJECT_PERCENT`%。`0` に設定するとベースラインなし）を明確に上回る<br>`gsdirector.matchmaking_cycle.match.rejections.assigned` == 0<br>`gsdirector.matchmaking_cycle.match.deactivation_timeouts` == 0 | `om_core.cache.replication.lag` は低く健全<br>`om_core.mmf.deactivation.timeouts` == 0 | 同一サイクル内で並行実行された複数のMMFまたはプロファイルが同じチケットを選択し、Director内の `acceptedTicketsThisCycle` によってローカルで衝突が解決されたことを示します。 |
 | **3. 非有効化確認のタイムアウト** | `gsdirector.matchmaking_cycle.match.deactivation_timeouts` > 0<br>`gsdirector.matchmaking_cycle.ticket.deactivation_timeouts` > 0<br>`gsdirector.matchmaking_cycle.duration` の増加 | `om_core.mmf.deactivation.timeouts` > 0<br>`om_core.mmf.deactivation.wait` が `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` に接近 | `om-core` が `OM_MATCH_TICKET_DEACTIVATION_TIMEOUT_MS` 以内にマッチ内チケットのローカル非有効化を確認できず、`deactivation_timeout=true` を付与したことを示します。 |
 | **4. チケット有効化・再有効化の失敗** | `mmqueue.ticket.activations.failures` > 0<br>`gsdirector.ticket.reactivations.failures` > 0 | `om_core.ticket.activation.failures.invalid_id` > 0<br>`om_core.ticket.activation.failures.unspecified` > 0<br>`om_core.rpc.errors` > 0 | `invalid_id` > 0 の場合はMMFが架空または破損したチケットIDをロスターに入れたことを示し、`unspecified` > 0 の場合は `ActivateTickets` 中にRedisステートストアエラーが発生したことを示します。 |
-| **5. MMF呼び出し・ストリームの失敗** | `gsdirector.mmf.response.failures` > 0<br>`mmqueue.ticket.creations` > 0 なのに `gsdirector.matchmaking_cycle.match.proposals` が 0 に低下 | `om_core.mmf.failures` > 0<br>`om_core.mmf.deactivations` が停滞したまま `om_core.cache.tickets.active` が増加 | MMFがタイムアウト（`OM_MMF_TIMEOUT_SECS`）したか、gRPCエラーを返したか、`om-core` から到達不能であることを示します。 |
+| **5. MMF呼び出し・ストリームの失敗** | `gsdirector.mmf.response.failures` > 0（`om-core` のMMFごとの `MMF_FAILURE` ステータスやトランスポート／HTTPエラーを含め、エラーで終了した `InvokeMatchmakingFunctions` 呼び出し数をカウント）<br>`mmqueue.ticket.creations` > 0 なのに `gsdirector.matchmaking_cycle.match.proposals` が 0 に低下 | `om_core.mmf.failures` > 0<br>`om_core.mmf.ticket.deactivations` が停滞したまま `om_core.cache.tickets.active` が増加 | MMFがタイムアウト（`OM_MMF_TIMEOUT_SECS`）したか、gRPCエラーを返したか、`om-core` から到達不能であることを示します。Directorはエラー詳細から失敗したMMF名（`failed_mmfs`）をログ出力します。 |
 
 **対処手順 (Remediation Steps)**:
 
