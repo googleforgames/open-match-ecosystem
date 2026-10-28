@@ -26,6 +26,7 @@ package assignmentdistributor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -47,23 +48,26 @@ type PubSubPublisher struct {
 
 // NewPubSubPublisher does not create or delete topics for the publisher (It assumes the topic
 // ID you send to it has already been created.)
-func NewPubSubPublisher(projectID string, topicID string, log *logrus.Logger) *PubSubPublisher {
-
-	// Get Pub/Sub specific configuration
+//
+// On failure it logs the error and returns it rather than exiting the process, so the caller
+// can shut down cleanly (flushing metrics and stopping anything it already started) before exiting.
+func NewPubSubPublisher(projectID string, topicID string, log *logrus.Logger) (*PubSubPublisher, error) {
 	if projectID == "" || topicID == "" {
-		log.Fatalln("For 'pubsub' assignment distribution, Google Cloud Project ID and an existing Topic ID to use must be provided")
+		err := errors.New("for 'pubsub' assignment distribution, Google Cloud Project ID and an existing Topic ID to use must be provided")
+		log.Error(err)
+		return nil, err
 	}
 
-	// Create a Pub/Sub client
 	ctx := context.Background()
 	client, err := pubsub.NewClient(ctx, projectID)
 	if err != nil {
-		log.Fatalf("Failed to initialize pubsub client to receive assignments: %v", err)
+		wrappedErr := fmt.Errorf("failed to initialize pubsub client to send assignments: %w", err)
+		log.Error(wrappedErr)
+		return nil, wrappedErr
 	}
 
-	// Connect to the Pub/Sub topic & instantiate the Pub/Sub receiver
-	publisher := client.Publisher(fmt.Sprintf("projects/%v/topics/%v", projectID, topicID))
-	return &PubSubPublisher{client: client, publisher: publisher, log: log}
+	publisher := client.Publisher("projects/" + projectID + "/topics/" + topicID)
+	return &PubSubPublisher{client: client, publisher: publisher, log: log}, nil
 }
 
 func (p *PubSubPublisher) Send(ctx context.Context, roster *pb.Roster) error {
@@ -99,22 +103,29 @@ type PubSubSubscriber struct {
 	log       *logrus.Logger
 }
 
-func NewPubSubSubscriber(projectID string, topicID string, log *logrus.Logger) *PubSubSubscriber {
-	// Get Pub/Sub specific configuration
+// NewPubSubSubscriber creates a unique subscription to the given topic for this instance.
+//
+// On failure it logs the error and returns it rather than exiting the process, so the caller
+// can shut down cleanly (flushing metrics and stopping anything it already started) before exiting.
+func NewPubSubSubscriber(projectID string, topicID string, log *logrus.Logger) (*PubSubSubscriber, error) {
 	if projectID == "" || topicID == "" {
-		log.Fatalln("For 'pubsub' assignment distribution, Google Cloud Project ID and an existing Topic ID to use must be provided")
+		err := errors.New("for 'pubsub' assignment distribution, Google Cloud Project ID and an existing Topic ID to use must be provided")
+		log.Error(err)
+		return nil, err
 	}
 
-	// Create a Pub/Sub client
 	ctx, cancel := context.WithCancel(context.Background())
 	client, err := pubsub.NewClient(ctx, projectID)
 	if err != nil {
-		log.Fatalf("Failed to initialize pubsub client to receive assignments: %v", err)
+		cancel()
+		wrappedErr := fmt.Errorf("failed to initialize pubsub client to receive assignments: %w", err)
+		log.Error(wrappedErr)
+		return nil, wrappedErr
 	}
 
 	// Unique subscription name for each application instance.
-	tName := fmt.Sprintf("projects/%v/topics/%v", projectID, topicID)
-	sName := fmt.Sprintf("projects/%v/subscriptions/mmqueue-%s-sub", projectID, uuid.NewString())
+	tName := "projects/" + projectID + "/topics/" + topicID
+	sName := fmt.Sprintf("projects/%s/subscriptions/mmqueue-%s-sub", projectID, uuid.NewString())
 	log.Infof("Creating subscription: '%s' for topic: '%s'", sName, tName)
 	sub, err := client.SubscriptionAdminClient.CreateSubscription(ctx,
 		&pubsubpb.Subscription{
@@ -129,7 +140,11 @@ func NewPubSubSubscriber(projectID string, topicID string, log *logrus.Logger) *
 		},
 	)
 	if err != nil {
-		log.Fatalf("Failed to create Pub/Sub subscription: %v", err)
+		_ = client.Close()
+		cancel()
+		wrappedErr := fmt.Errorf("failed to create Pub/Sub subscription %s for topic %s: %w", sName, tName, err)
+		log.Error(wrappedErr)
+		return nil, wrappedErr
 	}
 
 	return &PubSubSubscriber{
@@ -137,9 +152,18 @@ func NewPubSubSubscriber(projectID string, topicID string, log *logrus.Logger) *
 		sub:       client.Subscriber(sub.GetName()),
 		ctxCancel: cancel,
 		log:       log,
-	}
+	}, nil
 }
 
+// Receive listens for assignment messages on this subscriber's subscription and
+// calls handler for each valid roster. Receive returns when its context is cancelled.
+//
+// Every subscriber has its own subscription, so every mmqueue instance receives
+// every assignment, including those for other instances' tickets, which the
+// handler is expected to ignore. This keeps the sample simple, but means each
+// instance processes all assignment traffic; see the README for ways to shard
+// it at larger scale.
+//
 // Note: This uses pubsub's streaming pull feature. This feature has properties
 // that may be surprising. Please take a look at
 // https://cloud.google.com/pubsub/docs/pull#streamingpull for more details on
@@ -148,8 +172,12 @@ func (r *PubSubSubscriber) Receive(ctx context.Context, handler func(ctx context
 	return r.sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
 		var roster pb.Roster
 		if err := proto.Unmarshal(msg.Data, &roster); err != nil {
-			r.log.Errorf("Failed to unmarshal roster from Pub/Sub message: %v", err)
-			msg.Nack() // Nack the message so it can be redelivered
+			// A message that cannot be parsed now never will be, so Ack it to
+			// discard it; a Nack would have Pub/Sub redeliver it immediately,
+			// forever. In production, configure a dead-letter topic on the
+			// subscription to keep such messages for analysis.
+			r.log.Errorf("Discarding Pub/Sub message %s: cannot unmarshal roster: %v", msg.ID, err)
+			msg.Ack()
 			return
 		}
 
@@ -158,12 +186,17 @@ func (r *PubSubSubscriber) Receive(ctx context.Context, handler func(ctx context
 	})
 }
 
-// cleanup function for Pub/Sub
+// Stop deletes this subscriber's subscription and closes the client. Callers
+// should stop receiving first, by cancelling the context passed to Receive.
 func (r *PubSubSubscriber) Stop() {
 	r.log.Infof("Cleaning up assignment pubsub subscription %s...", r.sub.String())
 
-	// Use a new, short-lived context to ensure subscription cleanup runs.
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Use a fresh context because the application's context is usually already
+	// cancelled during shutdown. Keep the timeout short so cleanup fits in
+	// Cloud Run's shutdown grace period (the example mains give this step 3
+	// seconds); if deletion fails, the subscription's 24-hour expiration policy
+	// removes it eventually.
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	err := r.client.SubscriptionAdminClient.DeleteSubscription(
 		cleanupCtx,
@@ -175,10 +208,7 @@ func (r *PubSubSubscriber) Stop() {
 		r.log.Infof("Successfully deleted subscription %s", r.sub.String())
 	}
 
-	// Cancelling the subscriber's context is the idiomatic way to quit listening to a subscription.
+	// Cancel the context the client was created with, then close the client connection.
 	r.ctxCancel()
-
-	// close the client connection
 	r.client.Close()
-
 }

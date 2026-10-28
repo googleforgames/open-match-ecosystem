@@ -262,3 +262,24 @@ func TestChannelSenderStopUnblocksAndConcurrentRace(t *testing.T) {
 		}
 	}
 }
+
+func TestChannelSenderStopDoesNotCloseCallerChannel(t *testing.T) {
+	ch := make(chan *pb.Roster, 1)
+	sender := NewChannelSender(ch)
+
+	sender.Stop()
+
+	if err := sender.Send(context.Background(), &pb.Roster{Name: "after-stop"}); !errors.Is(err, ErrSenderStopped) {
+		t.Fatalf("Send after Stop returned %v, want %v", err, ErrSenderStopped)
+	}
+
+	select {
+	case r := <-ch:
+		t.Fatalf("stopped sender sent unexpected roster despite free buffer space: %v", r)
+	default:
+	}
+
+	// As the channel's owner, sending a roster and closing the channel must not panic.
+	ch <- &pb.Roster{Name: "owner-roster"}
+	close(ch)
+}

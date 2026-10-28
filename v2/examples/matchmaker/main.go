@@ -237,17 +237,25 @@ func main() {
 		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
 
 		// Instantiate the Pub/Sub Publisher
-		publisher = assignmentdistributor.NewPubSubPublisher(
+		var err error
+		publisher, err = assignmentdistributor.NewPubSubPublisher(
 			cfg.GetString("GCP_PROJECT_ID"),
 			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
 			log,
 		)
+		if err != nil {
+			logger.Fatal("Unrecoverable error initializing Pub/Sub publisher")
+		}
 		// Instantiate the Pub/Sub Receiver
-		receiver = assignmentdistributor.NewPubSubSubscriber(
+		receiver, err = assignmentdistributor.NewPubSubSubscriber(
 			cfg.GetString("GCP_PROJECT_ID"),
 			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
 			log,
 		)
+		if err != nil {
+			publisher.Stop()
+			logger.Fatal("Unrecoverable error initializing Pub/Sub subscriber")
+		}
 	case "channel":
 		fallthrough // default is 'channel'
 	default:

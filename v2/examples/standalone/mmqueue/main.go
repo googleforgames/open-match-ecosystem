@@ -176,11 +176,15 @@ func main() {
 		log.Println("Using Google Cloud Pub/Sub for assignment distribution")
 
 		// Instantiate the Pub/Sub receiver
-		receiver = assignmentdistributor.NewPubSubSubscriber(
+		var err error
+		receiver, err = assignmentdistributor.NewPubSubSubscriber(
 			cfg.GetString("GCP_PROJECT_ID"),
 			cfg.GetString("ASSIGNMENT_TOPIC_ID"),
 			log,
 		)
+		if err != nil {
+			logger.Fatal("Unrecoverable error initializing Pub/Sub subscriber")
+		}
 	}
 
 	// Initialize the queue

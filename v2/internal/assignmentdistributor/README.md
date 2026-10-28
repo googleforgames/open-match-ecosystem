@@ -55,12 +55,17 @@ default:
     // make a unique topic subscription.
     log.Println("Using Google Cloud Pub/Sub for assignment distribution")
 
-    // Instantiate the Pub/Sub receiver
-    publisher = assignmentdistributor.NewPubSubPublisher(
+    // Instantiate the Pub/Sub publisher. On failure the constructor logs the
+    // error; returning 1 exits through run's deferred cleanup.
+    var err error
+    publisher, err = assignmentdistributor.NewPubSubPublisher(
         cfg.GetString("GCP_PROJECT_ID"),
         cfg.GetString("ASSIGNMENT_TOPIC_ID"),
         log,
     )
+    if err != nil {
+        return 1
+    }
 }
 ```
 
@@ -86,12 +91,17 @@ default:
     // make a unique topic subscription.
     log.Println("Using Google Cloud Pub/Sub for assignment distribution")
 
-    // Instantiate the Pub/Sub receiver
-    receiver = assignmentdistributor.NewPubSubSubscriber(
+    // Instantiate the Pub/Sub receiver. On failure the constructor logs the
+    // error; returning 1 exits through run's deferred cleanup.
+    var err error
+    receiver, err = assignmentdistributor.NewPubSubSubscriber(
         cfg.GetString("GCP_PROJECT_ID"),
         cfg.GetString("ASSIGNMENT_TOPIC_ID"),
         log,
     )
+    if err != nil {
+        return 1
+    }
 }
 ```
 
@@ -132,8 +142,12 @@ func (r *PubSubSubscriber) Receive(ctx context.Context, handler func(ctx context
     return r.sub.Receive(ctx, func(ctx context.Context, msg *pubsub.Message) {
         var roster pb.Roster
         if err := proto.Unmarshal(msg.Data, &roster); err != nil {
-            r.log.Errorf("Failed to unmarshal roster from Pub/Sub message: %v", err)
-            msg.Nack() // Nack the message so it can be redelivered
+            // A message that cannot be parsed now never will be, so Ack it to
+            // discard it; a Nack would have Pub/Sub redeliver it immediately,
+            // forever. In production, configure a dead-letter topic on the
+            // subscription to keep such messages for analysis.
+            r.log.Errorf("Discarding Pub/Sub message %s: cannot unmarshal roster: %v", msg.ID, err)
+            msg.Ack()
             return
         }
 
@@ -144,9 +158,18 @@ func (r *PubSubSubscriber) Receive(ctx context.Context, handler func(ctx context
 }
 ```
 
+#### Fan-out: every queue instance receives every assignment
+
+Each `PubSubSubscriber` creates its own subscription, so with `N` matchmaking queue instances every assignment is delivered `N` times, once to each instance; each instance only tracks the tickets it created and ignores assignments for the rest. This keeps the sample simple (the director need not know which instance created which ticket), but has costs:
+
+* Every instance processes all assignment traffic, so per-instance load grows with the total match rate rather than with that instance's share of players.
+* The matchmaking queue's `mmqueue.ticket.assignments.untracked` metric counts assignments for tickets the instance is not tracking; with Pub/Sub it is roughly `(N - 1) * assignments`, plus redeliveries and assignments for tickets the instance has stopped tracking (expired or abandoned), so it scales with the number of instances and is not by itself a sign of a problem. Use `mmqueue.ticket.assignments`, which only counts the instance's own tickets, to check assignment delivery.
+
+At larger scale, route each assignment only to the instance that needs it, for example by sharding topics (or using subscription filters on a message attribute) by queue instance or player shard, and having the director publish each roster's tickets to the right shard.
+
 #### **4\. Shutdown**
 
-When the application is shutting down, the Stop method is called on both the publisher and subscriber. The PubSubPublisher stops the publisher and closes the client connection. The subscription will be automatically deleted after 24 hours due to the default configuration, but this should only be relied upon to prevent 'leaking' subscriptions \- best practices are to have the PubSubSubscriber delete its unique subscription, cancel its context to stop listening, and close the client connection before the application stops.
+When the application is shutting down, the Stop method is called on both the publisher and subscriber. The PubSubPublisher stops the publisher and closes the client connection. The subscription will be automatically deleted after 24 hours due to the default configuration, but this should only be relied upon to prevent 'leaking' subscriptions \- best practices are to stop receiving (by cancelling the context passed to `Receive`), then have the `PubSubSubscriber` delete its unique subscription and close the client connection before the application stops. The deletion uses a short (3 second) timeout so shutdown fits within Cloud Run's grace period. Both constructors return an error (after logging it) instead of exiting the process, so the caller can shut down cleanly if Pub/Sub cannot be set up.
 
 *Example from v2/internal/assignmentdistributor/pubsub.go*:
 
@@ -162,8 +185,12 @@ func (p *PubSubPublisher) Stop() {
 func (r *PubSubSubscriber) Stop() {
     r.log.Infof("Cleaning up assignment pubsub subscription %s...", r.sub.String())
 
-    // Use a new, short-lived context to ensure subscription cleanup runs.
-    cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    // Use a fresh context because the application's context is usually already
+    // cancelled during shutdown. Keep the timeout short so cleanup fits in
+    // Cloud Run's shutdown grace period (the example mains give this step 3
+    // seconds); if deletion fails, the subscription's 24-hour expiration policy
+    // removes it eventually.
+    cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
     defer cancel()
     err := r.client.SubscriptionAdminClient.DeleteSubscription(
         cleanupCtx,
@@ -175,11 +202,8 @@ func (r *PubSubSubscriber) Stop() {
         r.log.Infof("Successfully deleted subscription %s", r.sub.String())
     }
 
-    // Cancelling the subscriber's context is the idiomatic way to quit listening to a subscription.
+    // Cancel the context the client was created with, then close the client connection.
     r.ctxCancel()
-
-    // close the client connection
     r.client.Close()
-
 }
 ```
