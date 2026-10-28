@@ -19,8 +19,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -63,6 +67,7 @@ func newTestQueue(t *testing.T, serverURL string, maxConcurrent int) (*Matchmake
 	cfg.Set("MAX_CONCURRENT_TICKET_CREATIONS", maxConcurrent)
 	cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 50)
 	cfg.Set("TICKET_CREATION_CYCLES", 1)
+	cfg.Set("MMQUEUE_TICKET_TTL_MS", 600000)
 
 	log := newTestLogger()
 	meterPtr, reader := newTestMeter(t)
@@ -76,10 +81,127 @@ func newTestQueue(t *testing.T, serverURL string, maxConcurrent int) (*Matchmake
 		Log:                log,
 		ClientRequestChan:  make(chan *ClientRequest, 100),
 		AssignmentReceiver: receiver,
-		AssignmentsChan:    assignChan,
 		OtelMeterPtr:       meterPtr,
 	}
 	return q, sender, reader
+}
+
+func readDeactivateRequest(t *testing.T, r *http.Request) []string {
+	t.Helper()
+	if r.Method != http.MethodDelete {
+		t.Errorf("deactivate HTTP method = %q, want %q", r.Method, http.MethodDelete)
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Errorf("reading deactivate body: %v", err)
+		return nil
+	}
+	var req pb.DeactivateTicketsRequest
+	if err := protojson.Unmarshal(body, &req); err != nil {
+		t.Errorf("unmarshalling DeactivateTicketsRequest: %v", err)
+		return nil
+	}
+	return req.GetTicketIds()
+}
+
+func expectSingleResultAndClosed(t *testing.T, ch <-chan int, wantCode int) {
+	t.Helper()
+	select {
+	case got, ok := <-ch:
+		if !ok {
+			t.Fatalf("ResultChan closed without a value, want %d", wantCode)
+		}
+		if got != wantCode {
+			t.Fatalf("ResultChan status = %d, want %d", got, wantCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for status %d on ResultChan", wantCode)
+	}
+
+	select {
+	case extra, ok := <-ch:
+		if ok {
+			t.Fatalf("ResultChan received unexpected second value %d after %d", extra, wantCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ResultChan to be closed")
+	}
+}
+
+func pickArrivalSeed(t *testing.T, cfg *viper.Viper, n int64, window, margin time.Duration) uint64 {
+	t.Helper()
+	limit := window - margin
+	for seed := uint64(1); seed < 1000; seed++ {
+		rng := rand.New(rand.NewPCG(seed, seed))
+		sched := poissonArrivalSchedule(rng, n, window)
+		if len(sched) == 0 || sched[len(sched)-1] <= limit {
+			cfg.Set("TICKET_ARRIVAL_SEED", seed)
+			return seed
+		}
+	}
+	t.Fatalf("no seed in 1..999 placed %d arrivals within %v - %v", n, window, margin)
+	return 0
+}
+
+func readInt64Counter(t *testing.T, reader *sdkmetric.ManualReader, metricName string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("reader.Collect failed: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == metricName {
+				if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) > 0 {
+					return sum.DataPoints[0].Value
+				}
+			}
+		}
+	}
+	return 0
+}
+
+type fakeOMServerOpts struct {
+	ticketID        string
+	activateEntered chan<- struct{}
+	releaseActivate <-chan struct{}
+	deactivatedCh   chan<- []string
+}
+
+func startFakeOMServer(t *testing.T, opts fakeOMServerOpts) *httptest.Server {
+	t.Helper()
+	var enterOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/tickets":
+			respBytes, _ := protojson.Marshal(&pb.CreateTicketResponse{TicketId: opts.ticketID})
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(respBytes)
+		case "/tickets:activate":
+			if opts.activateEntered != nil {
+				enterOnce.Do(func() {
+					close(opts.activateEntered)
+				})
+			}
+			if opts.releaseActivate != nil {
+				<-opts.releaseActivate
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		case "/tickets:deactivate":
+			ids := readDeactivateRequest(t, r)
+			if opts.deactivatedCh != nil {
+				opts.deactivatedCh <- ids
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 // 1. Concurrency Slot Limit
@@ -286,9 +408,10 @@ func TestRun_ActivationConfirmationBarrierBeforeHTTP200(t *testing.T) {
 	<-runDone
 }
 
-// 3. Permanent Activation Failure Returns HTTP 500 and Evicts Ticket
-func TestRun_PermanentActivationFailureReturnsHTTP500AndEvictsTicket(t *testing.T) {
+// 3. Permanent Activation Failure Returns HTTP 502, Evicts Ticket, and Deactivates
+func TestRun_PermanentActivationFailureReturnsHTTP502EvictsAndDeactivates(t *testing.T) {
 	const ticketID = "ticket-perm-fail-1"
+	deactivatedCh := make(chan []string, 1)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -300,6 +423,11 @@ func TestRun_PermanentActivationFailureReturnsHTTP500AndEvictsTicket(t *testing.
 		case "/tickets:activate":
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"code":3,"message":"invalid ticket id"}`))
+		case "/tickets:deactivate":
+			ids := readDeactivateRequest(t, r)
+			deactivatedCh <- ids
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -324,17 +452,19 @@ func TestRun_PermanentActivationFailureReturnsHTTP500AndEvictsTicket(t *testing.
 		ResultChan: resChan,
 	}
 
-	select {
-	case code := <-resChan:
-		if code != http.StatusInternalServerError {
-			t.Fatalf("ResultChan status = %d, want %d", code, http.StatusInternalServerError)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for 500 status on permanent activation failure")
-	}
+	expectSingleResultAndClosed(t, resChan, http.StatusBadGateway)
 
 	if _, exists := q.Tickets.Load(ticketID); exists {
 		t.Fatalf("expected permanently failed ticket %q to be evicted from q.Tickets", ticketID)
+	}
+
+	select {
+	case ids := <-deactivatedCh:
+		if !slices.Equal(ids, []string{ticketID}) {
+			t.Fatalf("deactivated ticket IDs = %v, want [%s]", ids, ticketID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for DELETE /tickets:deactivate after activation failure")
 	}
 
 	cancel()
@@ -348,8 +478,8 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-// 4. Context Cancellation Unblocks and Drains Pending Waiters
-func TestRun_ContextCancellationUnblocksAndDrainsPendingWaiters(t *testing.T) {
+// 4. Shutdown Answers Every Pending Request Once
+func TestRun_ShutdownAnswersEveryPendingRequestOnce(t *testing.T) {
 	var createCalls atomic.Int32
 	activateEntered := make(chan struct{})
 	releaseActivate := make(chan struct{})
@@ -382,7 +512,7 @@ func TestRun_ContextCancellationUnblocksAndDrainsPendingWaiters(t *testing.T) {
 			callNum := createCalls.Add(1)
 			switch callNum {
 			case 1:
-				respBytes, _ := protojson.Marshal(&pb.CreateTicketResponse{TicketId: "seed-activate-ticket"})
+				respBytes, _ := protojson.Marshal(&pb.CreateTicketResponse{TicketId: "req-0-ticket"})
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),
@@ -391,7 +521,7 @@ func TestRun_ContextCancellationUnblocksAndDrainsPendingWaiters(t *testing.T) {
 			case 2:
 				close(create1Entered)
 				<-releaseCreate1
-				respBytes, _ := protojson.Marshal(&pb.CreateTicketResponse{TicketId: "pending-act-ticket"})
+				respBytes, _ := protojson.Marshal(&pb.CreateTicketResponse{TicketId: "req-1-ticket"})
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),
@@ -400,7 +530,7 @@ func TestRun_ContextCancellationUnblocksAndDrainsPendingWaiters(t *testing.T) {
 			default:
 				close(create2Entered)
 				<-releaseCreate2
-				respBytes, _ := protojson.Marshal(&pb.CreateTicketResponse{TicketId: "post-shutdown-ticket"})
+				respBytes, _ := protojson.Marshal(&pb.CreateTicketResponse{TicketId: "req-2-ticket"})
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     make(http.Header),
@@ -439,102 +569,68 @@ func TestRun_ContextCancellationUnblocksAndDrainsPendingWaiters(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Ticket 0: enters /tickets:activate and holds ActivateTicketsWithResults open until releaseActivate.
-	q.ClientRequestChan <- &ClientRequest{Ticket: &pb.Ticket{}, ResultChan: nil}
+	// Request 0: created (releasing its creation slot) and blocks inside /tickets:activate.
+	res0 := make(chan int, 1)
+	q.ClientRequestChan <- &ClientRequest{Ticket: &pb.Ticket{}, ResultChan: res0}
 	select {
 	case <-activateEntered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for seed ticket to enter /tickets:activate")
+		t.Fatal("timed out waiting for Request 0 to enter /tickets:activate")
 	}
 
-	// Ticket 1: occupies concurrency slot 1 inside /tickets.
+	// Request 1: occupies creation slot 1 inside /tickets.
 	res1 := make(chan int, 1)
 	q.ClientRequestChan <- &ClientRequest{Ticket: &pb.Ticket{}, ResultChan: res1}
 	select {
 	case <-create1Entered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Ticket 1 to enter /tickets")
+		t.Fatal("timed out waiting for Request 1 to enter /tickets")
 	}
 
-	// Ticket 2: occupies concurrency slot 2 inside /tickets.
+	// Request 2: occupies creation slot 2 inside /tickets.
 	res2 := make(chan int, 1)
 	q.ClientRequestChan <- &ClientRequest{Ticket: &pb.Ticket{}, ResultChan: res2}
 	select {
 	case <-create2Entered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Ticket 2 to enter /tickets")
+		t.Fatal("timed out waiting for Request 2 to enter /tickets")
 	}
 
-	// Ticket 3: read from unbuffered ClientRequestChan and blocked waiting for a concurrency slot.
+	// Request 3: read from unbuffered ClientRequestChan and blocked waiting for a creation slot.
 	res3 := make(chan int, 1)
 	q.ClientRequestChan <- &ClientRequest{Ticket: &pb.Ticket{}, ResultChan: res3}
 
-	// Cancel ctx: Ticket 3 is waiting for a concurrency slot.
+	// Cancel queue context while om-core calls are still blocked.
 	cancel()
 
-	// 1) Request waiting for a concurrency slot must unblock with 408 RequestTimeout.
-	select {
-	case code := <-res3:
-		if code != http.StatusRequestTimeout {
-			t.Fatalf("slot-waiter status = %d, want %d", code, http.StatusRequestTimeout)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for slot-blocked request to unblock with 408")
-	}
+	// Request 3 (waiting for a slot) and Request 0 (waiting for activation)
+	// must each receive 503 and be closed before om-core responds.
+	expectSingleResultAndClosed(t, res3, http.StatusServiceUnavailable)
+	expectSingleResultAndClosed(t, res0, http.StatusServiceUnavailable)
 
-	// 2) Release Ticket 1 while ActivateTicketsWithResults is still held open on Ticket 0,
-	// so Ticket 1 is stored in q.Tickets and pendingActivations before activationResults closes.
+	// Releasing create 1, then create 2, gives each 503 and closes it.
 	close(releaseCreate1)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, exists := q.Tickets.Load("pending-act-ticket"); exists {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if _, exists := q.Tickets.Load("pending-act-ticket"); !exists {
-		t.Fatal("expected pending-act-ticket to be stored in q.Tickets before activation shutdown completes")
-	}
+	expectSingleResultAndClosed(t, res1, http.StatusServiceUnavailable)
 
-	// Now release Ticket 0's activation call so ActivateTicketsWithResults exits and closes activationResults,
-	// draining pendingActivations with 408 and removing pending-act-ticket from q.Tickets.
-	close(releaseActivate)
-
-	select {
-	case code := <-res1:
-		if code != http.StatusRequestTimeout {
-			t.Fatalf("pending-activation waiter status = %d, want %d", code, http.StatusRequestTimeout)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for pending-activation waiter to drain with 408")
-	}
-
-	if _, exists := q.Tickets.Load("pending-act-ticket"); exists {
-		t.Fatal("expected pending-act-ticket to be removed from q.Tickets on shutdown")
-	}
-
-	// 3) Release Ticket 2 after activation shutdown has set activationClosed = true;
-	// it must immediately drain with 408 and not remain in q.Tickets.
 	close(releaseCreate2)
+	expectSingleResultAndClosed(t, res2, http.StatusServiceUnavailable)
 
-	select {
-	case code := <-res2:
-		if code != http.StatusRequestTimeout {
-			t.Fatalf("in-flight request status = %d, want %d", code, http.StatusRequestTimeout)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for in-flight request to drain with 408")
-	}
-
-	if _, exists := q.Tickets.Load("post-shutdown-ticket"); exists {
-		t.Fatal("expected post-shutdown-ticket not to remain in q.Tickets")
-	}
-
+	// Release activation and stop assignment sender; Run must exit cleanly with empty Tickets.
+	close(releaseActivate)
 	sender.Stop()
 	select {
 	case <-runDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for q.Run to exit")
+	}
+
+	var leftover []any
+	q.Tickets.Range(func(key, _ any) bool {
+		leftover = append(leftover, key)
+		return true
+	})
+	if len(leftover) != 0 {
+		t.Fatalf("expected q.Tickets to be empty after shutdown, got %v", leftover)
 	}
 }
 
@@ -594,7 +690,7 @@ func TestGenerateTestTickets_ImmediateExitOnContextCancellation(t *testing.T) {
 
 	ticketGenerated := make(chan struct{})
 	var genOnce sync.Once
-	q.SetTestTicketConfig(50, func(_ context.Context) *pb.Ticket {
+	q.SetTestTicketConfig(5000, func(_ context.Context) *pb.Ticket {
 		genOnce.Do(func() {
 			close(ticketGenerated)
 		})
@@ -654,6 +750,10 @@ func TestMetrics_TicketActivationCountersAndDeprecatedMetricAbsence(t *testing.T
 			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{}`))
+		case "/tickets:deactivate":
+			_ = readDeactivateRequest(t, r)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -672,21 +772,14 @@ func TestMetrics_TicketActivationCountersAndDeprecatedMetricAbsence(t *testing.T
 		close(runDone)
 	}()
 
-	expectedStatuses := []int{http.StatusOK, http.StatusOK, http.StatusInternalServerError}
-	for i, wantStatus := range expectedStatuses {
+	expectedStatuses := []int{http.StatusOK, http.StatusOK, http.StatusBadGateway}
+	for _, wantStatus := range expectedStatuses {
 		resChan := make(chan int, 1)
 		q.ClientRequestChan <- &ClientRequest{
 			Ticket:     &pb.Ticket{},
 			ResultChan: resChan,
 		}
-		select {
-		case got := <-resChan:
-			if got != wantStatus {
-				t.Fatalf("request %d status = %d, want %d", i+1, got, wantStatus)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for request %d result", i+1)
-		}
+		expectSingleResultAndClosed(t, resChan, wantStatus)
 	}
 
 	var rm metricdata.ResourceMetrics
@@ -698,7 +791,7 @@ func TestMetrics_TicketActivationCountersAndDeprecatedMetricAbsence(t *testing.T
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			switch m.Name {
-			case "mmqueue.ticket.activation.requests", "mmqueue.ticket.activations.per_call":
+			case "mmqueue.ticket.activation.requests", "mmqueue.ticket.activations.per_call", "mmqueue.ticket.deletion.failures":
 				t.Fatalf("deprecated metric %q must not be registered", m.Name)
 			case "mmqueue.ticket.activations":
 				sum, ok := m.Data.(metricdata.Sum[int64])
@@ -773,9 +866,7 @@ func TestRun_AssignmentDeliveryAndQueuedDurationMetrics(t *testing.T) {
 		Ticket:     &pb.Ticket{},
 		ResultChan: resChan,
 	}
-	if code := <-resChan; code != http.StatusOK {
-		t.Fatalf("ResultChan status = %d, want %d", code, http.StatusOK)
-	}
+	expectSingleResultAndClosed(t, resChan, http.StatusOK)
 
 	createdAt := timestamppb.New(time.Now().Add(-150 * time.Millisecond))
 	err := sender.Send(ctx, &pb.Roster{
@@ -811,7 +902,7 @@ func TestRun_AssignmentDeliveryAndQueuedDurationMetrics(t *testing.T) {
 		t.Fatalf("reader.Collect failed: %v", err)
 	}
 
-	var assignmentsVal, deletionFailuresVal int64
+	var assignmentsVal, untrackedVal int64
 	var queuedCount uint64
 	var queuedSum float64
 
@@ -822,9 +913,9 @@ func TestRun_AssignmentDeliveryAndQueuedDurationMetrics(t *testing.T) {
 				if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) > 0 {
 					assignmentsVal = sum.DataPoints[0].Value
 				}
-			case "mmqueue.ticket.deletion.failures":
+			case "mmqueue.ticket.assignments.untracked":
 				if sum, ok := m.Data.(metricdata.Sum[int64]); ok && len(sum.DataPoints) > 0 {
-					deletionFailuresVal = sum.DataPoints[0].Value
+					untrackedVal = sum.DataPoints[0].Value
 				}
 			case "mmqueue.ticket.queued_durations":
 				if hist, ok := m.Data.(metricdata.Histogram[float64]); ok && len(hist.DataPoints) > 0 {
@@ -838,8 +929,8 @@ func TestRun_AssignmentDeliveryAndQueuedDurationMetrics(t *testing.T) {
 	if assignmentsVal != 1 {
 		t.Fatalf("mmqueue.ticket.assignments = %d, want 1", assignmentsVal)
 	}
-	if deletionFailuresVal != 2 {
-		t.Fatalf("mmqueue.ticket.deletion.failures = %d, want 2", deletionFailuresVal)
+	if untrackedVal != 2 {
+		t.Fatalf("mmqueue.ticket.assignments.untracked = %d, want 2", untrackedVal)
 	}
 	if queuedCount != 1 || queuedSum < 100 {
 		t.Fatalf("mmqueue.ticket.queued_durations count=%d sum=%v, want count=1 sum>=100ms", queuedCount, queuedSum)
@@ -958,6 +1049,9 @@ func TestSetTestTicketConfig_PerInstanceIsolation(t *testing.T) {
 	q2.Cfg.Set("TICKET_CREATION_CYCLES", 1)
 	q2.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 60)
 
+	pickArrivalSeed(t, q1.Cfg, 2, 60*time.Millisecond, 20*time.Millisecond)
+	pickArrivalSeed(t, q2.Cfg, 5, 60*time.Millisecond, 20*time.Millisecond)
+
 	q1.SetTestTicketConfig(2, func(_ context.Context) *pb.Ticket {
 		return &pb.Ticket{Id: "q1-ticket"}
 	})
@@ -1014,11 +1108,11 @@ func TestSetTestTicketConfig_PerInstanceIsolation(t *testing.T) {
 	wg.Wait()
 
 	mu1.Lock()
-	got1 := append([]string(nil), q1Tickets...)
+	got1 := slices.Clone(q1Tickets)
 	mu1.Unlock()
 
 	mu2.Lock()
-	got2 := append([]string(nil), q2Tickets...)
+	got2 := slices.Clone(q2Tickets)
 	mu2.Unlock()
 
 	if len(got1) != 2 {
@@ -1061,4 +1155,653 @@ func TestSetTestTicketConfig_PerInstanceIsolation(t *testing.T) {
 	}
 	assertGauge(rm1, 2)
 	assertGauge(rm2, 5)
+}
+
+// 12. Confirmations After the Deadline Are Counted
+func TestGenerateTestTickets_LateConfirmationsCounted(t *testing.T) {
+	q, _, reader := newTestQueue(t, "http://127.0.0.1:0", 3)
+	q.Cfg.Set("TICKET_CREATION_CYCLES", 1)
+	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 50)
+	pickArrivalSeed(t, q.Cfg, 5, 50*time.Millisecond, 20*time.Millisecond)
+	q.ClientRequestChan = make(chan *ClientRequest)
+
+	q.SetTestTicketConfig(5, func(_ context.Context) *pb.Ticket {
+		return &pb.Ticket{}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	var held []*ClientRequest
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case req := <-q.ClientRequestChan:
+				mu.Lock()
+				held = append(held, req)
+				mu.Unlock()
+			}
+		}
+	}()
+
+	genDone := make(chan struct{})
+	go func() {
+		q.GenerateTestTickets(ctx)
+		close(genDone)
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+
+	select {
+	case <-genDone:
+		t.Fatal("GenerateTestTickets returned before late confirmations were delivered")
+	default:
+	}
+
+	mu.Lock()
+	accepted := slices.Clone(held)
+	mu.Unlock()
+	if len(accepted) != 5 {
+		t.Fatalf("accepted requests after 150ms = %d, want 5", len(accepted))
+	}
+
+	accepted[0].ResultChan <- http.StatusInternalServerError
+	close(accepted[0].ResultChan)
+	for _, req := range accepted[1:] {
+		req.ResultChan <- http.StatusOK
+		close(req.ResultChan)
+	}
+
+	select {
+	case <-genDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for GenerateTestTickets to return after confirmations")
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("reader.Collect failed: %v", err)
+	}
+
+	var foundActual, foundConfirmed bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch m.Name {
+			case "mmqueue.tpc.actual":
+				hist, ok := m.Data.(metricdata.Histogram[int64])
+				if !ok || len(hist.DataPoints) != 1 || hist.DataPoints[0].Count != 1 || hist.DataPoints[0].Sum != 5 {
+					t.Fatalf("mmqueue.tpc.actual = %+v, want 1 data point with sum 5", m.Data)
+				}
+				foundActual = true
+			case "mmqueue.tpc.confirmed":
+				hist, ok := m.Data.(metricdata.Histogram[int64])
+				if !ok || len(hist.DataPoints) != 1 || hist.DataPoints[0].Count != 1 || hist.DataPoints[0].Sum != 4 {
+					t.Fatalf("mmqueue.tpc.confirmed = %+v, want 1 data point with sum 4", m.Data)
+				}
+				foundConfirmed = true
+			}
+		}
+	}
+	if !foundActual || !foundConfirmed {
+		t.Fatalf("missing expected metrics: actual=%v confirmed=%v", foundActual, foundConfirmed)
+	}
+}
+
+// 13. Carry-Over of an Unqueued Ticket
+func TestGenerateTestTickets_CarryOverUnqueuedTicket(t *testing.T) {
+	q, _, _ := newTestQueue(t, "http://127.0.0.1:0", 3)
+	q.Cfg.Set("TICKET_CREATION_CYCLES", 3)
+	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", 40)
+	pickArrivalSeed(t, q.Cfg, 10, 40*time.Millisecond, 10*time.Millisecond)
+	q.ClientRequestChan = make(chan *ClientRequest) // unbuffered and undrained
+
+	var calls atomic.Int32
+	q.SetTestTicketConfig(10, func(_ context.Context) *pb.Ticket {
+		calls.Add(1)
+		return &pb.Ticket{}
+	})
+
+	q.GenerateTestTickets(context.Background())
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("ticket function calls across 3 blocked cycles = %d, want 1", got)
+	}
+}
+
+// 14. Poisson Schedule Shape
+func TestPoissonArrivalSchedule_Shape(t *testing.T) {
+	rng := rand.New(rand.NewPCG(42, 42))
+	const n = 5000
+	const window = time.Second
+
+	offsets := poissonArrivalSchedule(rng, n, window)
+	if len(offsets) != n {
+		t.Fatalf("len(offsets) = %d, want %d", len(offsets), n)
+	}
+	if !slices.IsSorted(offsets) {
+		t.Fatal("offsets are not sorted in ascending order")
+	}
+	if offsets[0] < 0 || offsets[len(offsets)-1] >= window {
+		t.Fatalf("offsets out of [0, %v): first=%v last=%v", window, offsets[0], offsets[len(offsets)-1])
+	}
+
+	gaps := make([]float64, n)
+	prev := time.Duration(0)
+	var sum float64
+	for i, off := range offsets {
+		g := float64(off - prev)
+		gaps[i] = g
+		sum += g
+		prev = off
+	}
+	mean := sum / float64(len(gaps))
+	wantMean := float64(window) / float64(n)
+	if math.Abs(mean-wantMean)/wantMean > 0.10 {
+		t.Fatalf("mean gap = %v ns, want within 10%% of %v ns", mean, wantMean)
+	}
+
+	var sqDiffSum float64
+	for _, g := range gaps {
+		d := g - mean
+		sqDiffSum += d * d
+	}
+	stdDev := math.Sqrt(sqDiffSum / float64(len(gaps)))
+	cv := stdDev / mean
+	if cv < 0.9 || cv > 1.1 {
+		t.Fatalf("gap coefficient of variation = %.4f, want in [0.9, 1.1]", cv)
+	}
+
+	if got := poissonArrivalSchedule(rng, 0, time.Second); got != nil {
+		t.Fatalf("poissonArrivalSchedule(n=0) = %v, want nil", got)
+	}
+
+	zeroWin := poissonArrivalSchedule(rng, 3, 0)
+	if !slices.Equal(zeroWin, []time.Duration{0, 0, 0}) {
+		t.Fatalf("poissonArrivalSchedule(n=3, window=0) = %v, want [0 0 0]", zeroWin)
+	}
+}
+
+// 15. Arrivals Spread Across the Cycle
+func TestGenerateTestTickets_ArrivalsSpreadAcrossCycle(t *testing.T) {
+	const tpc = 20
+	const cycleDur = 200 * time.Millisecond
+
+	q, _, _ := newTestQueue(t, "http://127.0.0.1:0", 3)
+	q.Cfg.Set("TICKET_CREATION_CYCLES", 1)
+	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", int(cycleDur.Milliseconds()))
+	seed := pickArrivalSeed(t, q.Cfg, tpc, cycleDur, 30*time.Millisecond)
+	q.ClientRequestChan = make(chan *ClientRequest)
+
+	expected := poissonArrivalSchedule(rand.New(rand.NewPCG(seed, seed)), tpc, cycleDur)
+	if span := expected[len(expected)-1] - expected[0]; span < cycleDur/2 {
+		t.Fatalf("precondition failed: seeded schedule span = %v, want >= %v", span, cycleDur/2)
+	}
+
+	q.SetTestTicketConfig(tpc, func(_ context.Context) *pb.Ticket {
+		return &pb.Ticket{}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var genStart time.Time
+	startReady := make(chan struct{})
+	var mu sync.Mutex
+	var acceptedOffsets []time.Duration
+
+	go func() {
+		<-startReady
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case req := <-q.ClientRequestChan:
+				elapsed := time.Since(genStart)
+				mu.Lock()
+				acceptedOffsets = append(acceptedOffsets, elapsed)
+				mu.Unlock()
+				req.ResultChan <- http.StatusOK
+				close(req.ResultChan)
+			}
+		}
+	}()
+
+	genStart = time.Now()
+	close(startReady)
+	q.GenerateTestTickets(ctx)
+
+	mu.Lock()
+	got := slices.Clone(acceptedOffsets)
+	mu.Unlock()
+
+	if len(got) != tpc {
+		t.Fatalf("accepted %d requests, want %d", len(got), tpc)
+	}
+	for i, actualOff := range got {
+		if actualOff < expected[i]-20*time.Millisecond {
+			t.Fatalf("arrival %d accepted at %v, more than 20ms before scheduled %v", i, actualOff, expected[i])
+		}
+	}
+	if span := got[len(got)-1] - got[0]; span < cycleDur/2 {
+		t.Fatalf("accepted arrivals span = %v, want >= %v", span, cycleDur/2)
+	}
+}
+
+// 16. Overdue Arrivals Released When the Queue Unblocks
+func TestGenerateTestTickets_OverdueArrivalsReleasedOnUnblock(t *testing.T) {
+	const tpc = 10
+	const cycleDur = 300 * time.Millisecond
+	const blockDur = 150 * time.Millisecond
+
+	q, _, reader := newTestQueue(t, "http://127.0.0.1:0", 3)
+	q.Cfg.Set("TICKET_CREATION_CYCLES", 1)
+	q.Cfg.Set("TICKET_CREATION_CYCLE_DURATION_MS", int(cycleDur.Milliseconds()))
+	q.ClientRequestChan = make(chan *ClientRequest)
+
+	var chosenSeed uint64
+	var sched []time.Duration
+	for s := uint64(1); s < 1000; s++ {
+		cand := poissonArrivalSchedule(rand.New(rand.NewPCG(s, s)), tpc, cycleDur)
+		if cand[0] <= 75*time.Millisecond && cand[len(cand)-1] <= 270*time.Millisecond {
+			chosenSeed = s
+			sched = cand
+			break
+		}
+	}
+	if chosenSeed == 0 {
+		t.Fatal("failed to find seed with first <= 75ms and last <= 270ms")
+	}
+	q.Cfg.Set("TICKET_ARRIVAL_SEED", chosenSeed)
+
+	q.SetTestTicketConfig(tpc, func(_ context.Context) *pb.Ticket {
+		return &pb.Ticket{}
+	})
+	q.ensureMetricsRegistered()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var accepted atomic.Int32
+	startBlock := make(chan struct{})
+	go func() {
+		<-startBlock
+		timer := time.NewTimer(blockDur)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case req := <-q.ClientRequestChan:
+				accepted.Add(1)
+				req.ResultChan <- http.StatusOK
+				close(req.ResultChan)
+			}
+		}
+	}()
+
+	close(startBlock)
+	q.GenerateTestTickets(ctx)
+
+	if got := accepted.Load(); got != tpc {
+		t.Fatalf("accepted = %d, want %d", got, tpc)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("reader.Collect failed: %v", err)
+	}
+
+	var foundLag bool
+	wantMinMaxMs := float64((blockDur - sched[0] - 10*time.Millisecond).Microseconds()) / 1000.0
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == "mmqueue.ticket.arrival_lag" {
+				hist, ok := m.Data.(metricdata.Histogram[float64])
+				if !ok || len(hist.DataPoints) != 1 {
+					t.Fatalf("mmqueue.ticket.arrival_lag = %+v, want 1 histogram data point", m.Data)
+				}
+				dp := hist.DataPoints[0]
+				if dp.Count != tpc {
+					t.Fatalf("mmqueue.ticket.arrival_lag count = %d, want %d", dp.Count, tpc)
+				}
+				maxVal, defined := dp.Max.Value()
+				if !defined || maxVal < wantMinMaxMs {
+					t.Fatalf("mmqueue.ticket.arrival_lag max = %v (defined=%v), want >= %v ms", maxVal, defined, wantMinMaxMs)
+				}
+				foundLag = true
+			}
+		}
+	}
+	if !foundLag {
+		t.Fatal("expected mmqueue.ticket.arrival_lag metric to be recorded")
+	}
+}
+
+// 17. Expiry Sweep Drops Expired Tickets
+func TestRun_ExpirySweepDropsExpiredTickets(t *testing.T) {
+	const ticketID = "expiring-ticket-1"
+	srv := startFakeOMServer(t, fakeOMServerOpts{ticketID: ticketID})
+
+	q, sender, reader := newTestQueue(t, srv.URL, 3)
+	q.Cfg.Set("MMQUEUE_TICKET_TTL_MS", 300) // sweep interval clamped to 100ms
+	q.Cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		q.Run(ctx)
+		close(runDone)
+	}()
+
+	resChan := make(chan int, 1)
+	q.ClientRequestChan <- &ClientRequest{
+		Ticket:     &pb.Ticket{},
+		ResultChan: resChan,
+	}
+	expectSingleResultAndClosed(t, resChan, http.StatusOK)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, exists := q.Tickets.Load(ticketID); !exists {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, exists := q.Tickets.Load(ticketID); exists {
+		t.Fatalf("expected %q to be swept from q.Tickets within 3s", ticketID)
+	}
+
+	if got := readInt64Counter(t, reader, "mmqueue.ticket.expirations"); got != 1 {
+		t.Fatalf("mmqueue.ticket.expirations = %d, want 1", got)
+	}
+
+	cancel()
+	sender.Stop()
+	<-runDone
+}
+
+// 18. Ticket Expiry Calculation
+func TestTicketExpiry_Calculation(t *testing.T) {
+	created := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+
+	// 1. Creation time with no ExpirationTime -> creation + 10m.
+	t1 := &pb.Ticket{
+		Attributes: &pb.Ticket_FilterableData{
+			CreationTime: timestamppb.New(created),
+		},
+	}
+	if got, want := ticketExpiry(t1, defaultTicketTTL), created.Add(10*time.Minute); !got.Equal(want) {
+		t.Fatalf("expiry without ExpirationTime = %v, want %v", got, want)
+	}
+
+	// 2. Earlier ExpirationTime (+1m) wins.
+	earlier := created.Add(1 * time.Minute)
+	t2 := &pb.Ticket{
+		ExpirationTime: timestamppb.New(earlier),
+		Attributes: &pb.Ticket_FilterableData{
+			CreationTime: timestamppb.New(created),
+		},
+	}
+	if got := ticketExpiry(t2, defaultTicketTTL); !got.Equal(earlier) {
+		t.Fatalf("expiry with earlier ExpirationTime = %v, want %v", got, earlier)
+	}
+
+	// 3. Later ExpirationTime (+1h) is capped at creation + 10m.
+	t3 := &pb.Ticket{
+		ExpirationTime: timestamppb.New(created.Add(1 * time.Hour)),
+		Attributes: &pb.Ticket_FilterableData{
+			CreationTime: timestamppb.New(created),
+		},
+	}
+	if got, want := ticketExpiry(t3, defaultTicketTTL), created.Add(10*time.Minute); !got.Equal(want) {
+		t.Fatalf("expiry with later ExpirationTime = %v, want %v", got, want)
+	}
+}
+
+// 19. Abandoned Before Create Skips CreateTicket
+func TestRun_AbandonedBeforeCreateSkipsCreateTicket(t *testing.T) {
+	var omCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		omCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	q, sender, reader := newTestQueue(t, srv.URL, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		q.Run(ctx)
+		close(runDone)
+	}()
+
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	clientCancel()
+
+	resChan := make(chan int, 1)
+	q.ClientRequestChan <- &ClientRequest{
+		Ctx:        clientCtx,
+		Ticket:     &pb.Ticket{},
+		ResultChan: resChan,
+	}
+
+	select {
+	case val, ok := <-resChan:
+		if ok {
+			t.Fatalf("ResultChan received %d on abandoned request, want closed without value", val)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for abandoned request ResultChan to close")
+	}
+
+	if got := omCalls.Load(); got != 0 {
+		t.Fatalf("om-core calls = %d, want 0", got)
+	}
+	if got := readInt64Counter(t, reader, "mmqueue.ticket.abandonments"); got != 1 {
+		t.Fatalf("mmqueue.ticket.abandonments = %d, want 1", got)
+	}
+
+	cancel()
+	sender.Stop()
+	<-runDone
+}
+
+// 20. Abandoned During Activation Deactivates After Activation
+func TestRun_AbandonedDuringActivationDeactivatesAfterActivation(t *testing.T) {
+	const ticketID = "abandoned-act-1"
+	activateEntered := make(chan struct{})
+	releaseActivate := make(chan struct{})
+	deactivatedCh := make(chan []string, 1)
+
+	srv := startFakeOMServer(t, fakeOMServerOpts{
+		ticketID:        ticketID,
+		activateEntered: activateEntered,
+		releaseActivate: releaseActivate,
+		deactivatedCh:   deactivatedCh,
+	})
+
+	q, sender, reader := newTestQueue(t, srv.URL, 3)
+	q.Cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		q.Run(ctx)
+		close(runDone)
+	}()
+
+	clientCtx, clientCancel := context.WithCancel(context.Background())
+	defer clientCancel()
+
+	resChan := make(chan int, 1)
+	q.ClientRequestChan <- &ClientRequest{
+		Ctx:        clientCtx,
+		Ticket:     &pb.Ticket{},
+		ResultChan: resChan,
+	}
+
+	select {
+	case <-activateEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for /tickets:activate to be entered")
+	}
+
+	clientCancel()
+
+	// Must NOT deactivate while activation is still in flight.
+	select {
+	case ids := <-deactivatedCh:
+		t.Fatalf("premature deactivation %v while activation still in flight", ids)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseActivate)
+
+	select {
+	case ids := <-deactivatedCh:
+		if !slices.Equal(ids, []string{ticketID}) {
+			t.Fatalf("deactivated ticket IDs = %v, want [%s]", ids, ticketID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for deactivation after in-flight activation completed")
+	}
+
+	select {
+	case val, ok := <-resChan:
+		if ok {
+			t.Fatalf("ResultChan received %d on abandoned request, want closed without value", val)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ResultChan to close after abandonment")
+	}
+
+	if _, exists := q.Tickets.Load(ticketID); exists {
+		t.Fatalf("expected abandoned ticket %q not to remain in q.Tickets", ticketID)
+	}
+	if got := readInt64Counter(t, reader, "mmqueue.ticket.abandonments"); got != 1 {
+		t.Fatalf("mmqueue.ticket.abandonments = %d, want 1", got)
+	}
+
+	cancel()
+	sender.Stop()
+	<-runDone
+}
+
+// 21. proxyCreateTicket Sets CreationTime and Preserves DoubleArgs Without example_mmr
+func TestProxyCreateTicket_SetsCreationTime(t *testing.T) {
+	receivedCh := make(chan *pb.CreateTicketRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := io.ReadAll(r.Body)
+		var req pb.CreateTicketRequest
+		if err := protojson.Unmarshal(body, &req); err != nil {
+			t.Errorf("unmarshalling CreateTicketRequest: %v", err)
+		}
+		receivedCh <- &req
+		respBytes, _ := protojson.Marshal(&pb.CreateTicketResponse{TicketId: "proxy-created-1"})
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(respBytes)
+	}))
+	defer srv.Close()
+
+	q, _, _ := newTestQueue(t, srv.URL, 3)
+
+	ticket := &pb.Ticket{
+		Attributes: &pb.Ticket_FilterableData{
+			CreationTime: timestamppb.New(time.Now().Add(-1 * time.Hour)),
+			DoubleArgs:   map[string]float64{"mmr": 1500},
+		},
+	}
+
+	before := time.Now()
+	id, err := q.proxyCreateTicket(context.Background(), ticket)
+	after := time.Now()
+	if err != nil {
+		t.Fatalf("proxyCreateTicket failed: %v", err)
+	}
+	if id != "proxy-created-1" {
+		t.Fatalf("ticket id = %q, want %q", id, "proxy-created-1")
+	}
+
+	var gotReq *pb.CreateTicketRequest
+	select {
+	case gotReq = <-receivedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for CreateTicketRequest")
+	}
+
+	gotTime := gotReq.GetTicket().GetAttributes().GetCreationTime().AsTime()
+	if gotTime.Before(before) || gotTime.After(after) {
+		t.Fatalf("received CreationTime = %v, want in [%v, %v]", gotTime, before, after)
+	}
+
+	wantDoubles := map[string]float64{"mmr": 1500}
+	if gotDoubles := gotReq.GetTicket().GetAttributes().GetDoubleArgs(); !maps.Equal(gotDoubles, wantDoubles) {
+		t.Fatalf("received DoubleArgs = %v, want %v", gotDoubles, wantDoubles)
+	}
+}
+
+// 22. Nil Ticket Gets a Real Expiry
+func TestRun_NilTicketGetsRealExpiry(t *testing.T) {
+	const ticketID = "nil-ticket-1"
+	srv := startFakeOMServer(t, fakeOMServerOpts{ticketID: ticketID})
+
+	q, sender, reader := newTestQueue(t, srv.URL, 3)
+	q.Cfg.Set("MMQUEUE_TICKET_TTL_MS", 60000)
+	q.Cfg.Set("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL", 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		q.Run(ctx)
+		close(runDone)
+	}()
+
+	resChan := make(chan int, 1)
+	q.ClientRequestChan <- &ClientRequest{
+		Ticket:     nil,
+		ResultChan: resChan,
+	}
+	expectSingleResultAndClosed(t, resChan, http.StatusOK)
+
+	val, exists := q.Tickets.Load(ticketID)
+	if !exists {
+		t.Fatalf("expected %q to be tracked in q.Tickets", ticketID)
+	}
+	expiry, ok := val.(time.Time)
+	if !ok {
+		t.Fatalf("q.Tickets[%q] value type = %T, want time.Time", ticketID, val)
+	}
+	if rem := time.Until(expiry); rem < 50*time.Second {
+		t.Fatalf("remaining TTL = %v, want >= 50s", rem)
+	}
+
+	q.sweepExpiredTickets(ctx, time.Now())
+
+	if _, stillTracked := q.Tickets.Load(ticketID); !stillTracked {
+		t.Fatalf("expected %q to remain tracked after manual sweep at current time", ticketID)
+	}
+	if got := readInt64Counter(t, reader, "mmqueue.ticket.expirations"); got != 0 {
+		t.Fatalf("mmqueue.ticket.expirations = %d, want 0", got)
+	}
+
+	cancel()
+	sender.Stop()
+	<-runDone
 }
