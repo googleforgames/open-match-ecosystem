@@ -28,8 +28,9 @@ var (
 	})
 
 	// Metric variable declarations are global, so they can be accessed directly in the application code.
-	// Metrics populated by the grpc function implementations in main.go.
-	otelMMFResponseFailures                otelmetrics.Int64Counter
+	// Instruments are recorded by MockDirector.Run in gsdirector.go.
+	otelMMFInvocationFailures              otelmetrics.Int64Counter
+	otelMMFFeedbackResponses               otelmetrics.Int64Counter
 	otelTicketReactivationFailures         otelmetrics.Int64Counter
 	otelTicketsRejectedPerCycle            otelmetrics.Int64Histogram
 	otelAssignedTicketsInMatchesPerCycle   otelmetrics.Int64Histogram
@@ -54,9 +55,18 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	var err error
 
 	// Initialize all declared Metrics
-	otelMMFResponseFailures, err = meter.Int64Counter(
+	// Kept under its original name ("gsdirector.mmf.response.failures") so existing dashboards keep working.
+	otelMMFInvocationFailures, err = meter.Int64Counter(
 		metricsNamePrefix+"mmf.response.failures",
-		otelmetrics.WithDescription("Total MMF response stream errors"),
+		otelmetrics.WithDescription("Number of InvokeMatchmakingFunctions calls that returned an error (transport or HTTP failure, an MMF failure reported by om-core, or the director-side deadline), by profile.name and grpc.code"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	otelMMFFeedbackResponses, err = meter.Int64Counter(
+		metricsNamePrefix+"mmf.feedback_responses",
+		otelmetrics.WithDescription("Number of MMF responses with no tickets (a ticketless match, or no match at all), treated as MMF feedback rather than match proposals, by profile.name"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -80,7 +90,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelAssignedTicketsInMatchesPerCycle, err = meter.Int64Histogram(
 		metricsNamePrefix+"ticket.rejections.assigned",
-		otelmetrics.WithDescription("Number of tickets among those rejected per cycle due to being in a match with a ticket that was already assigned"),
+		otelmetrics.WithDescription("Number of previously assigned tickets found in proposed matches per cycle (the matches containing them are rejected)"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -88,7 +98,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelTicketActivationsPerCycle, err = meter.Int64Histogram(
 		metricsNamePrefix+"ticket.reactivations",
-		otelmetrics.WithDescription("Number of tickets re-activated per cycle due to rejected matches, server allocation failures, etc"),
+		otelmetrics.WithDescription("Number of tickets queued for re-activation per cycle (unclaimed tickets from rejected matches and server allocation failures)"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
@@ -160,7 +170,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 
 	otelMatchmakingCycleDuration, err = meter.Float64Histogram(
 		metricsNamePrefix+"matchmaking_cycle.duration",
-		otelmetrics.WithDescription("Length of matchmaking cycles"),
+		otelmetrics.WithDescription("Wall-clock duration of each matchmaking cycle, including the wait before the next cycle (or until shutdown, if it was cut short)"),
 		otelmetrics.WithUnit("ms"),
 	)
 	if err != nil {
