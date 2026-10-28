@@ -202,7 +202,7 @@ func (q *MatchmakerQueue) Run(ctx context.Context) {
 		// Make a derived context with the activationType 'activate', which is used
 		// by the omclient to distinguish between logs for initial ticket activation
 		// and re-activation after a failed matching attempt.
-		atCtx := context.WithValue(ctx, "activationType", "activate") //nolint:staticcheck // omclient reads string key "activationType"
+		atCtx := omclient.WithActivationType(ctx, "activate")
 
 		activationResults := make(chan omclient.ActivationResult, 1000)
 		var resultsWg sync.WaitGroup

@@ -1111,7 +1111,7 @@ func (d *MockDirector) Run(ctx context.Context) {
 		aLogger.Trace("requesting re-activation of rejected tickets")
 
 		// request re-activation of rejected tickets.
-		atCtx := context.WithValue(ctx, "activationType", "reactivate") //nolint:staticcheck // omclient reads string key "activationType"
+		atCtx := omclient.WithActivationType(ctx, "reactivate")
 		reactivationResults := make(chan omclient.ActivationResult, 1000)
 		var resultsWg sync.WaitGroup
 		resultsWg.Add(1)
