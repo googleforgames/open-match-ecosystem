@@ -37,10 +37,16 @@ substitutions:
   _OTEL_SIDECAR_IMAGE: otel-collector-sidecar
 
   # Application environment vars
+  # Must be om-core's exact Cloud Run service URL (https://...) because it is
+  # also the audience of the ID token used to call it.
   _OM_CORE_ADDR: OM_CORE_CLOUD_RUN_URL
+  # MMF addresses are passed to om-core, which calls them; on Cloud Run they
+  # must include the https:// scheme so om-core authenticates with an ID token.
   _SOLODUEL_ADDR: SOLODUEL_CLOUD_RUN_URL
   _SOLODUEL_PORT: "443"
-  _DEBUGMMF_ADDR: DEBUGMMF_CLOUD_RUN_URL
+  # The DEBUG MMF is opt-in: set this to its Cloud Run URL to enable it; "none"
+  # disables it.
+  _DEBUGMMF_ADDR: "none"
   _DEBUGMMF_PORT: "443"
 
 steps:
@@ -107,32 +113,51 @@ steps:
       - "DEBUGMMF_ADDR=${_DEBUGMMF_ADDR}"
       - --update-env-vars
       - "DEBUGMMF_PORT=${_DEBUGMMF_PORT}"
-      # Optional environment variable overrides (shown with defaults):
+      # Optional environment variable overrides (shown with defaults; see ../README.md for descriptions):
       # - --update-env-vars
       # - "LOGGING_FORMAT=json"
       # - --update-env-vars
       # - "LOGGING_LEVEL=info"
       # - --update-env-vars
+      # - "LOG_CALLER=false"
+      # - --update-env-vars
       # - "OTEL_SIDECAR=true"
       # - --update-env-vars
-      # - "PROM_PORT=2223"
+      # - "OTEL_PROM_PORT=2227"
       # - --update-env-vars
       # - "INITIAL_TPC=10"
       # - --update-env-vars
-      # - "TICKET_CREATION_CYCLES=300"
+      # - "TICKET_CREATION_CYCLES=2147483647"
       # - --update-env-vars
       # - "TICKET_CREATION_CYCLE_DURATION_MS=1000"
       # - --update-env-vars
+      # - "TICKET_ARRIVAL_SEED=0"
+      # - --update-env-vars
       # - "MAX_CONCURRENT_TICKET_CREATIONS=500"
       # - --update-env-vars
-      # - "NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT=10"
+      # - "MMQUEUE_TICKET_TTL_MS=600000"
+      # - --update-env-vars
+      # - "NUM_MM_CYCLES=2147483647"
+      # - --update-env-vars
+      # - "NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT=2147483647"
       # - --update-env-vars
       # - "ASSIGNMENT_TTL_MS=1200000"
       # - --update-env-vars
+      # - "ASSIGNMENT_DISTRIBUTION_PATH=channel"
+      # - --update-env-vars
       # - "REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=false"
+      # - --update-env-vars
+      # - "RANDOM_MATCH_REJECT_PERCENT=1"
       # - --update-env-vars
       # - "MM_CYCLE_MIN_DURATION_MS=5000"
       # - --update-env-vars
+      # - "MMF_INVOCATION_TIMEOUT_SECS=600"
+      # - --update-env-vars
+      # - "OM_CORE_REQUEST_TIMEOUT_MS=5000"
+      # Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL:
+      # - --update-env-vars
       # - "OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL=500"
+      # - --update-env-vars
+      # - "OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS=10"
       # - --update-env-vars
       # - "WAIT_FOR_BACKFILL_MMFS=false"

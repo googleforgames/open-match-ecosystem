@@ -32,9 +32,9 @@ substitutions:
   _JOB_NAME: soloduel
   _REGION: us-central1
   _SERVICE_ACCOUNT: soloduel-identity
-  _ARTIFACT_REGISTRY_REPO: open-match-2-Test
-  _MMF_IMAGE_NAME: om-FIFO-mmf:0.0.1
-  _OTEL_SIDECAR_IMAGE: otel-collector-sidecar
+  # Artifact Registry repository and image names must be lowercase.
+  _ARTIFACT_REGISTRY_REPO: open-match
+  _MMF_IMAGE_NAME: soloduel:latest
 
   # Application environment vars
   _MMF_FUNCTION: fifo
@@ -61,6 +61,17 @@ steps:
       - --execution-environment
       - gen2
       - --use-http2
+      # Each InvokeMatchmakingFunctions call holds one streaming request open
+      # for as long as the MMF runs. Cloud Run's default request timeout (300s)
+      # is shorter than om-core's OM_MMF_TIMEOUT_SECS (default 600s), so without
+      # this Cloud Run would cut long MMF streams before om-core does. 3600s is
+      # Cloud Run's maximum; om-core's deadline still applies.
+      - --timeout
+      - "3600"
+      # One warm instance avoids a cold start on the first matchmaking cycle
+      # after a quiet period; set to "0" to scale to zero when idle.
+      - --min-instances
+      - "1"
 
       # Network config
       - --network
@@ -74,17 +85,16 @@ steps:
       - --ingress
       - internal
 
-      # sidecar 'opentelemetry-collector' config
-      - --container
-      - opentelemetry-collector
-      - --image
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_OTEL_SIDECAR_IMAGE}'
+      # This MMF emits no metrics, so it is deployed without an
+      # opentelemetry-collector sidecar. An instrumented MMF should add one
+      # (see ../../matchmaker/deploy/cloudbuild.yaml for an example).
 
       # main 'mmf' container config
       - --container
       - mmf
       - --image
       - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_MMF_IMAGE_NAME}'
+      # Cloud Run passes this to the container as the PORT env var.
       - --port
       - "8080"
       - --memory

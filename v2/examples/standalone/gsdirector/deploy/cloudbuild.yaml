@@ -32,18 +32,27 @@ substitutions:
   _JOB_NAME: gsdirector
   _REGION: us-central1
   _SERVICE_ACCOUNT: gsdirector-identity
-  _ARTIFACT_REGISTRY_REPO: open-match-2-Test
+  # Artifact Registry repository and image names must be lowercase.
+  _ARTIFACT_REGISTRY_REPO: open-match-2-test
   _GSDIRECTOR_IMAGE_NAME: om-standalone-gsdirector:0.0.1
   _OTEL_SIDECAR_IMAGE: otel-collector-sidecar
 
   # Application environment vars
+  # Must be om-core's exact Cloud Run service URL (https://...) because it is
+  # also the audience of the ID token used to call it.
   _OM_CORE_ADDR: OM_CORE_CLOUD_RUN_URL
+  # MMF addresses are passed to om-core, which calls them; on Cloud Run they
+  # must include the https:// scheme so om-core authenticates with an ID token.
   _SOLODUEL_ADDR: SOLODUEL_CLOUD_RUN_URL
   _SOLODUEL_PORT: "443"
-  _DEBUGMMF_ADDR: ""
+  # The DEBUG MMF is opt-in: set this to its Cloud Run URL to enable it; "none"
+  # disables it.
+  _DEBUGMMF_ADDR: "none"
   _DEBUGMMF_PORT: "443"
-  _PUBSUB_PROJECT_ID: GCP_PROJECT_ID
-  _PUBSUB_ASSIGNMENT_TOPIC: "om-demo-Topic"
+  _GCP_PROJECT_ID: GCP_PROJECT_ID
+  # Existing Pub/Sub topic to publish assignments to; mmqueue instances
+  # subscribe to this same topic.
+  _ASSIGNMENT_TOPIC_ID: "om-demo-topic"
 
 steps:
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -110,22 +119,30 @@ steps:
       - --update-env-vars
       - "DEBUGMMF_PORT=${_DEBUGMMF_PORT}"
       - --update-env-vars
-      - "PUBSUB_PROJECT_ID=${_PUBSUB_PROJECT_ID}"
+      - "GCP_PROJECT_ID=${_GCP_PROJECT_ID}"
       - --update-env-vars
-      - "PUBSUB_ASSIGNMENT_TOPIC=${_PUBSUB_ASSIGNMENT_TOPIC}"
-      # Optional environment variable overrides (shown with defaults):
+      - "ASSIGNMENT_TOPIC_ID=${_ASSIGNMENT_TOPIC_ID}"
+      # Optional environment variable overrides (shown with defaults; see ../README.md for descriptions):
       # - --update-env-vars
       # - "LOGGING_FORMAT=json"
       # - --update-env-vars
       # - "LOGGING_LEVEL=info"
       # - --update-env-vars
+      # - "LOG_CALLER=false"
+      # - --update-env-vars
       # - "OTEL_SIDECAR=true"
       # - --update-env-vars
-      # - "PROM_PORT=2225"
+      # - "OTEL_PROM_PORT=2225"
+      # - --update-env-vars
+      # - "ASSIGNMENT_DISTRIBUTION_PATH=pubsub"
+      # - --update-env-vars
+      # - "NUM_MM_CYCLES=2147483647"
       # - --update-env-vars
       # - "MM_CYCLE_MIN_DURATION_MS=5000"
       # - --update-env-vars
-      # - "NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT=10"
+      # - "MMF_INVOCATION_TIMEOUT_SECS=600"
+      # - --update-env-vars
+      # - "NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT=2147483647"
       # - --update-env-vars
       # - "ASSIGNMENT_TTL_MS=1200000"
       # - --update-env-vars
@@ -133,4 +150,11 @@ steps:
       # - --update-env-vars
       # - "WAIT_FOR_BACKFILL_MMFS=false"
       # - --update-env-vars
+      # - "RANDOM_MATCH_REJECT_PERCENT=1"
+      # - --update-env-vars
+      # - "OM_CORE_REQUEST_TIMEOUT_MS=5000"
+      # Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL:
+      # - --update-env-vars
       # - "OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL=500"
+      # - --update-env-vars
+      # - "OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS=10"

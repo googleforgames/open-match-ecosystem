@@ -32,14 +32,20 @@ substitutions:
   _JOB_NAME: mmqueue
   _REGION: us-central1
   _SERVICE_ACCOUNT: mmqueue-identity
-  _ARTIFACT_REGISTRY_REPO: open-match-2-Test
+  # Artifact Registry repository and image names must be lowercase.
+  _ARTIFACT_REGISTRY_REPO: open-match-2-test
   _MMQUEUE_IMAGE_NAME: om-standalone-mmqueue:0.0.1
   _OTEL_SIDECAR_IMAGE: otel-collector-sidecar
 
   # Application environment vars
+  # Must be om-core's exact Cloud Run service URL (https://...) because it is
+  # also the audience of the ID token used to call it.
   _OM_CORE_ADDR: OM_CORE_CLOUD_RUN_URL
-  _PUBSUB_PROJECT_ID: GCP_PROJECT_ID
-  _PUBSUB_ASSIGNMENT_SUBSCRIPTION: "om-demo-Subscription"
+  _GCP_PROJECT_ID: GCP_PROJECT_ID
+  # The Pub/Sub topic the gsdirector publishes to (not a subscription). Each
+  # mmqueue instance creates its own subscription to it, so the service account
+  # needs roles/pubsub.editor (or equivalent).
+  _ASSIGNMENT_TOPIC_ID: "om-demo-topic"
   _INITIAL_TPC: "0"
 
 steps:
@@ -97,25 +103,38 @@ steps:
       - --update-env-vars
       - "OM_CORE_ADDR=${_OM_CORE_ADDR}"
       - --update-env-vars
-      - "PUBSUB_PROJECT_ID=${_PUBSUB_PROJECT_ID}"
+      - "GCP_PROJECT_ID=${_GCP_PROJECT_ID}"
       - --update-env-vars
-      - "PUBSUB_ASSIGNMENT_SUBSCRIPTION=${_PUBSUB_ASSIGNMENT_SUBSCRIPTION}"
+      - "ASSIGNMENT_TOPIC_ID=${_ASSIGNMENT_TOPIC_ID}"
       - --update-env-vars
       - "INITIAL_TPC=${_INITIAL_TPC}"
-      # Optional environment variable overrides (shown with defaults):
+      # Optional environment variable overrides (shown with defaults; see ../README.md for descriptions):
       # - --update-env-vars
       # - "LOGGING_FORMAT=json"
       # - --update-env-vars
       # - "LOGGING_LEVEL=info"
       # - --update-env-vars
+      # - "LOG_CALLER=false"
+      # - --update-env-vars
       # - "OTEL_SIDECAR=true"
       # - --update-env-vars
-      # - "PROM_PORT=2224"
+      # - "OTEL_PROM_PORT=2224"
       # - --update-env-vars
-      # - "TICKET_CREATION_CYCLES=300"
+      # - "ASSIGNMENT_DISTRIBUTION_PATH=pubsub"
+      # - --update-env-vars
+      # - "TICKET_CREATION_CYCLES=2147483647"
       # - --update-env-vars
       # - "TICKET_CREATION_CYCLE_DURATION_MS=1000"
       # - --update-env-vars
+      # - "TICKET_ARRIVAL_SEED=0"
+      # - --update-env-vars
       # - "MAX_CONCURRENT_TICKET_CREATIONS=500"
       # - --update-env-vars
+      # - "MMQUEUE_TICKET_TTL_MS=600000"
+      # - --update-env-vars
+      # - "OM_CORE_REQUEST_TIMEOUT_MS=5000"
+      # Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL:
+      # - --update-env-vars
       # - "OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL=500"
+      # - --update-env-vars
+      # - "OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS=10"

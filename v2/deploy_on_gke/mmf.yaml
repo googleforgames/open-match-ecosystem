@@ -1,3 +1,20 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This is the fifo ("soloduel") MMF, reached by om-core through
+# soloduel-service on port 80 (matchmaker.yaml sets SOLODUEL_PORT to "80"),
+# which forwards to the container's gRPC port 8080.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,11 +29,36 @@ spec:
       labels:
         app: soloduel
     spec:
+      # The MMF server gives in-flight Run streams up to 8s to finish after
+      # SIGTERM before force-closing them.
+      terminationGracePeriodSeconds: 15
       containers:
       - name: soloduel
         image: us-docker.pkg.dev/open-match-public-images/open-match2/soloduel
+        env:
+        # The MMF defaults to 50090 for local runs; set PORT explicitly to match
+        # containerPort and the Service targetPort.
+        - name: PORT
+          value: "8080"
+        - name: MMF_FUNCTION
+          value: "fifo"
         ports:
-        - containerPort: 8080
+        - name: grpc
+          containerPort: 8080
+        # The MMF holds every ticket of a profile in memory while matching; size
+        # the limit for the largest pools.
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        # Ready once the gRPC server accepts connections.
+        readinessProbe:
+          tcpSocket:
+            port: grpc
+          initialDelaySeconds: 1
+          periodSeconds: 5
 ---
 apiVersion: v1
 kind: Service
@@ -26,6 +68,7 @@ spec:
   selector:
     app: soloduel
   ports:
-  - port: 80
-    targetPort: 8080
+  - name: grpc
+    port: 80
+    targetPort: grpc
   type: ClusterIP
