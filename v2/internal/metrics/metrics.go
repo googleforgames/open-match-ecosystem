@@ -28,13 +28,18 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+
+	"open-match.dev/open-match-ecosystem/v2/internal/logging"
 )
 
 // ServiceVersion is the default OpenTelemetry service version attribute.
 const ServiceVersion = "2.1.0"
 
 var (
-	otelLogger = logrus.WithFields(logrus.Fields{
+	// Uses the shared application logger, so it follows the LOGGING_LEVEL /
+	// LOGGING_FORMAT the application configures with logging.NewSharedLogger,
+	// which updates this same logger in place.
+	otelLogger = logging.GetSharedLogger().WithFields(logrus.Fields{
 		"app":            "matchmaker",
 		"component":      "metrics",
 		"implementation": "otel",
@@ -43,11 +48,14 @@ var (
 
 // InitializeOtel sets up the Open Telemetry endpoint to send data to the
 // observability backend you've configured (by default, Google Cloud
-// Observability Suite). NOTE: the OTEL modules have a set of environment
-// variables they read from directly to decide what host/port their endpoint
-// runs on. For more details, see
+// Observability Suite). serviceName is recorded as the service.name resource
+// attribute so each application's metrics can be told apart, and it can still
+// be overridden with the OTEL_SERVICE_NAME environment variable.
+// NOTE: the OTEL modules have a set of environment variables they read from
+// directly to decide what host/port their endpoint runs on. For more details,
+// see
 // https://opentelemetry.io/docs/languages/sdk-configuration/otlp-exporter/
-func InitializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
+func InitializeOtel(serviceName string) (*otelmetrics.Meter, func(context.Context) error) {
 	ctx := context.Background()
 
 	// Get resource attributes
@@ -60,7 +68,7 @@ func InitializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
 		// Open Match attributes
 		resource.WithAttributes(
 			semconv.ServiceNamespaceKey.String("matchmaker"),
-			semconv.ServiceNameKey.String("example"),
+			semconv.ServiceNameKey.String(serviceName),
 			semconv.ServiceVersionKey.String(ServiceVersion),
 		),
 		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
@@ -91,10 +99,12 @@ func InitializeOtel() (*otelmetrics.Meter, func(context.Context) error) {
 	return &meter, provider.Shutdown
 }
 
-// InitializeOtelWithLocalProm runs  a default OpenTelemetry Reader and
+// InitializeOtelWithLocalProm runs a default OpenTelemetry Reader and
 // implements prometheus.Collector, allowing it to be used as both a Reader and
 // Collector. http://localhost:<port>/metrics . For use with local development.
-func InitializeOtelWithLocalProm(port int) (*otelmetrics.Meter, func(context.Context) error) { //nolint:unused
+// serviceName is recorded as the service.name resource attribute, and metrics
+// are served from their own ServeMux so the metrics port exposes only /metrics.
+func InitializeOtelWithLocalProm(port int, serviceName string) (*otelmetrics.Meter, func(context.Context) error) {
 	// Get resource attributes
 	res, err := resource.New(
 		context.Background(),
@@ -105,7 +115,7 @@ func InitializeOtelWithLocalProm(port int) (*otelmetrics.Meter, func(context.Con
 		// Open Match attributes
 		resource.WithAttributes(
 			semconv.ServiceNamespaceKey.String("matchmaker"),
-			semconv.ServiceNameKey.String("queue"),
+			semconv.ServiceNameKey.String(serviceName),
 			semconv.ServiceVersionKey.String(ServiceVersion),
 		),
 		// Discover and provide attributes from OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME environment variables.
@@ -127,9 +137,10 @@ func InitializeOtelWithLocalProm(port int) (*otelmetrics.Meter, func(context.Con
 
 	// Start the prometheus HTTP server and pass the exporter Collector to it
 	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
 		otelLogger.Infof("serving metrics at localhost:%v/metrics", port)
-		http.Handle("/metrics", promhttp.Handler())
-		err := http.ListenAndServe(fmt.Sprintf(":%v", port), nil) //nolint:gosec // Ignoring G114: Use of net/http serve function that has no support for setting timeouts.
+		err := http.ListenAndServe(fmt.Sprintf(":%v", port), mux) //nolint:gosec // Ignoring G114: Use of net/http serve function that has no support for setting timeouts.
 		if err != nil {
 			fmt.Printf("error serving http: %v", err)
 			return

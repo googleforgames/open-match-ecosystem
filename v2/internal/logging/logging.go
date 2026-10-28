@@ -24,11 +24,34 @@ import (
 )
 
 var (
-	// Default logging configuration: json that plays nicely with Google Cloud Run
-	logger = &logrus.Logger{
-		Out: os.Stdout,
-	}
+	// Default logging configuration is JSON that works well with Google Cloud Run,
+	// at Info level. The logger can be used before NewSharedLogger is called
+	// (anything logged during package init or early startup is written, not
+	// silently dropped), and NewSharedLogger then applies the configured format
+	// and level.
+	logger = newDefaultLogger()
 )
+
+// cloudRunJSONFormatter writes JSON with the field names Google Cloud Logging
+// recognizes (timestamp, severity, message).
+func cloudRunJSONFormatter() *logrus.JSONFormatter {
+	return &logrus.JSONFormatter{
+		FieldMap: logrus.FieldMap{
+			logrus.FieldKeyTime:  "timestamp",
+			logrus.FieldKeyLevel: "severity",
+			logrus.FieldKeyMsg:   "message",
+		},
+		TimestampFormat: time.RFC3339Nano,
+	}
+}
+
+func newDefaultLogger() *logrus.Logger {
+	l := logrus.New()
+	l.SetOutput(os.Stdout)
+	l.SetFormatter(cloudRunJSONFormatter())
+	l.SetLevel(logrus.InfoLevel)
+	return l
+}
 
 func GetSharedLogger() *logrus.Logger {
 	// Get previously setup logger.
@@ -39,20 +62,14 @@ func NewSharedLogger(cfg *viper.Viper) *logrus.Logger {
 	// Set up structured logging
 
 	// Default logging configuration is json that plays nicely with Google Cloud Run.
-	// This text formatter is much nicer for local debugging.
-	logger.SetFormatter(&logrus.JSONFormatter{
-		FieldMap: logrus.FieldMap{
-			logrus.FieldKeyTime:  "timestamp",
-			logrus.FieldKeyLevel: "severity",
-			logrus.FieldKeyMsg:   "message",
-		},
-		TimestampFormat: time.RFC3339Nano,
-	})
-	// Configured for text formatter instead
+	logger.SetFormatter(cloudRunJSONFormatter())
+	logFormat := "json"
+
+	// Configured for text formatter instead; this text formatter is much nicer for local debugging.
 	if cfg.IsSet("LOGGING_FORMAT") &&
 		strings.ToLower(cfg.GetString("LOGGING_FORMAT")) == "text" {
-		logger.Warnf("enabling text formatter")
 		logger.SetFormatter(&logrus.TextFormatter{})
+		logFormat = "text"
 	}
 
 	// Configured to include source line in logs
@@ -71,7 +88,9 @@ func NewSharedLogger(cfg *viper.Viper) *logrus.Logger {
 		}
 	}
 	logger.SetLevel(level)
-	logger.Infof("Logging level set to %v", logger.Level)
+	// Logged after the level and format are applied, so it is never filtered out
+	// and is written in the configured format.
+	logger.Infof("Logging level set to %v, format %s", logger.Level, logFormat)
 
 	return logger
 }

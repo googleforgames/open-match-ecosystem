@@ -214,9 +214,9 @@ func main() {
 
 	// Initialize Metrics
 	if cfg.GetBool("OTEL_SIDECAR") {
-		meterptr, otelShutdownFunc = metrics.InitializeOtel()
+		meterptr, otelShutdownFunc = metrics.InitializeOtel("matchmaker")
 	} else {
-		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"))
+		meterptr, otelShutdownFunc = metrics.InitializeOtelWithLocalProm(cfg.GetInt("OTEL_PROM_PORT"), "matchmaker")
 	}
 	defer func() {
 		flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)

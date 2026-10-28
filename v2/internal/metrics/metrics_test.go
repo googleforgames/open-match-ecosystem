@@ -25,7 +25,7 @@ func TestServiceVersionAndInitializeOtel(t *testing.T) {
 		t.Fatalf("got ServiceVersion %q, want %q", ServiceVersion, "2.1.0")
 	}
 
-	meterPtr, shutdown := InitializeOtel()
+	meterPtr, shutdown := InitializeOtel("metrics-test")
 	if meterPtr == nil || *meterPtr == nil {
 		t.Fatal("expected non-nil meter pointer from InitializeOtel")
 	}
