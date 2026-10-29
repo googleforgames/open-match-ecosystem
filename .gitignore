@@ -1,0 +1,10 @@
+v2/manual-cloud-e2e-runbook.md
+v2/examples/docs/
+
+# Binaries produced by running `go build` on an example from the v2 module root
+# (Go names the output after the package directory). The patterns are anchored
+# so the example source directories themselves are not ignored.
+/v2/matchmaker
+/v2/mmf
+/v2/gsdirector
+/v2/mmqueue

@@ -14,64 +14,80 @@
 package mmqueue
 
 import (
+	"context"
+
 	"github.com/sirupsen/logrus"
 	otelmetrics "go.opentelemetry.io/otel/metric"
 )
 
 const metricsNamePrefix = "mmqueue."
 
-var (
-	otelLogger = logrus.WithFields(logrus.Fields{
-		"app":            "matchmaker",
-		"component":      "queue",
-		"implementation": "otel",
-	})
+var otelLogger = logrus.WithFields(logrus.Fields{
+	"app":            "matchmaker",
+	"component":      "queue",
+	"implementation": "otel",
+})
 
-	// Metric variable declarations are global, so they can be accessed directly in the application code.
-	// Metrics populated by the grpc function implementations in main.go.
-	otelTicketAssignments                 otelmetrics.Int64Counter
-	otelTicketCreationRetries             otelmetrics.Int64Counter
-	otelTicketCreations                   otelmetrics.Int64Counter
-	otelTicketDeletionFailures            otelmetrics.Int64Counter
-	otelTicketsGeneratedPerCycle          otelmetrics.Int64ObservableGauge
-	otelTicketGenerationsAchievedPerCycle otelmetrics.Int64Histogram
-	otelTicketGenerationCycleDurations    otelmetrics.Int64Histogram
-	otelActivationsPerCall                otelmetrics.Int64Histogram
-	otelTicketQueuedDurations             otelmetrics.Float64Histogram
-)
+func (q *MatchmakerQueue) ensureMetricsRegistered() {
+	if q.OtelMeterPtr == nil || *q.OtelMeterPtr == nil {
+		return
+	}
+	q.metricsOnce.Do(func() {
+		q.registerMetrics()
+	})
+}
 
 //nolint:cyclop // Cyclop linter sees each metric initialization as +1 cyclomatic complexity for some reason.
-func registerMetrics(meterPointer *otelmetrics.Meter) {
-	meter := *meterPointer
+func (q *MatchmakerQueue) registerMetrics() {
+	if q.OtelMeterPtr == nil || *q.OtelMeterPtr == nil {
+		return
+	}
+	meter := *q.OtelMeterPtr
 	var err error
 
-	// Initialize all declared Metrics
-	otelTicketsGeneratedPerCycle, err = meter.Int64ObservableGauge(
+	q.tpcRequestGauge, err = meter.Int64ObservableGauge(
 		metricsNamePrefix+"tpc.request",
-		otelmetrics.WithDescription("Number of test tickets generations attempted per cycle (default 1 second)"),
+		otelmetrics.WithDescription("Average number of simulated player arrivals scheduled per cycle (default 1 second)"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketQueuedDurations, err = meter.Float64Histogram(
+	q.ticketQueuedDurationsHistogram, err = meter.Float64Histogram(
 		metricsNamePrefix+"ticket.queued_durations",
-		otelmetrics.WithDescription("Length of time spent by tickets in the queue"),
+		otelmetrics.WithDescription("Time from ticket creation to this mmqueue instance receiving the ticket's assignment"),
 		otelmetrics.WithUnit("ms"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
 
-	otelActivationsPerCall, err = meter.Int64Histogram(
-		metricsNamePrefix+"ticket.activation.requests",
-		otelmetrics.WithDescription("Total tickets set to active, so they appear in pools"),
+	q.ticketArrivalLagHistogram, err = meter.Float64Histogram(
+		metricsNamePrefix+"ticket.arrival_lag",
+		otelmetrics.WithDescription("Delay between a simulated player's scheduled arrival and the matchmaking queue accepting their request (test ticket generator only)"),
+		otelmetrics.WithUnit("ms"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketGenerationCycleDurations, err = meter.Int64Histogram(
+	q.ticketActivationsCounter, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.activations",
+		otelmetrics.WithDescription("Total number of tickets activated"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	q.ticketActivationFailuresCounter, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.activations.failures",
+		otelmetrics.WithDescription("Total number of ticket activations that permanently failed"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	q.ticketGenerationDurationHistogram, err = meter.Int64Histogram(
 		metricsNamePrefix+"ticket.generation.cycle_duration",
 		otelmetrics.WithDescription("Actual duration of ticket creation cycles"),
 		otelmetrics.WithUnit("ms"),
@@ -79,15 +95,24 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
-	otelTicketGenerationsAchievedPerCycle, err = meter.Int64Histogram(
+
+	q.tpcActualHistogram, err = meter.Int64Histogram(
 		metricsNamePrefix+"tpc.actual",
-		otelmetrics.WithDescription("Actual number of tickets successfully created each cycle"),
+		otelmetrics.WithDescription("Actual number of test tickets accepted into the matchmaking queue each cycle"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketCreations, err = meter.Int64Counter(
+	q.tpcConfirmedHistogram, err = meter.Int64Histogram(
+		metricsNamePrefix+"tpc.confirmed",
+		otelmetrics.WithDescription("Number of test tickets queued in a cycle that were confirmed created and activated by om-core (recorded once all of that cycle's results are in)"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	q.ticketCreationsCounter, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.creations",
 		otelmetrics.WithDescription("Total tickets created since startup"),
 	)
@@ -95,7 +120,7 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketCreationRetries, err = meter.Int64Counter(
+	q.ticketCreationRetriesCounter, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.creation.retries",
 		otelmetrics.WithDescription("Total number of times that ticket creation failed and was retried"),
 	)
@@ -103,20 +128,54 @@ func registerMetrics(meterPointer *otelmetrics.Meter) {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketAssignments, err = meter.Int64Counter(
+	q.ticketAssignmentsCounter, err = meter.Int64Counter(
 		metricsNamePrefix+"ticket.assignments",
-		otelmetrics.WithDescription("Total ticket assignments received"),
+		otelmetrics.WithDescription("Total assignments received for tickets this instance is tracking"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
 
-	otelTicketDeletionFailures, err = meter.Int64Counter(
-		metricsNamePrefix+"ticket.deletion.failures",
-		otelmetrics.WithDescription("Total ticket deletion failures"),
+	// With Pub/Sub assignment distribution, every mmqueue instance receives
+	// every assignment, so this counter grows with the number of instances. It
+	// is roughly (instances minus 1) times the number of assignments, plus
+	// redeliveries and assignments for tickets this instance stopped tracking
+	// (expired or abandoned).
+	q.untrackedAssignmentsCounter, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.assignments.untracked",
+		otelmetrics.WithDescription("Total assignments received for tickets this instance isn't tracking (other instances' tickets, duplicates, or tickets no longer tracked)"),
 	)
 	if err != nil {
 		otelLogger.Fatal(err)
 	}
 
+	q.ticketExpirationsCounter, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.expirations",
+		otelmetrics.WithDescription("Total tickets that reached their om-core expiration time before being assigned"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	q.ticketAbandonmentsCounter, err = meter.Int64Counter(
+		metricsNamePrefix+"ticket.abandonments",
+		otelmetrics.WithDescription("Total matchmaking requests whose client went away before the queue reported a result"),
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
+
+	_, err = meter.RegisterCallback(
+		func(_ context.Context, o otelmetrics.Observer) error {
+			q.tpcMu.Lock()
+			tpc := int64(q.TPC)
+			q.tpcMu.Unlock()
+			o.ObserveInt64(q.tpcRequestGauge, tpc)
+			return nil
+		},
+		q.tpcRequestGauge,
+	)
+	if err != nil {
+		otelLogger.Fatal(err)
+	}
 }

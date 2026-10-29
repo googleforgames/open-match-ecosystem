@@ -1,3 +1,17 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,19 +26,85 @@ spec:
       labels:
         app: matchmaker-example
     spec:
+      # The matchmaker's shutdown sequence is bounded to ~10s; 15s gives
+      # headroom before Kubernetes sends SIGKILL.
+      terminationGracePeriodSeconds: 15
       containers:
       - name: matchmaker-example
         image: us-docker.pkg.dev/open-match-public-images/open-match2/matchmaker-example
         ports:
-        - containerPort: 8080
+        - name: http
+          containerPort: 8081
+        # Prometheus metrics endpoint (because OTEL_SIDECAR is false); can be
+        # scraped, for example, with a Google Managed Prometheus PodMonitoring
+        # resource on port "metrics", path /metrics.
+        - name: metrics
+          containerPort: 2227
         env:
+        - name: PORT
+          value: "8081"
         - name: OM_CORE_ADDR
           value: "http://open-match-service.default.svc.cluster.local:50504"
         - name: SOLODUEL_ADDR
           value: "http://soloduel-service.default.svc.cluster.local"
         - name: SOLODUEL_PORT
           value: "80"
+        # om-core calls the MMFs, so an in-process DEBUG MMF on this pod's
+        # localhost is not reachable from om-core and must stay disabled.
+        - name: DEBUGMMF_ADDR
+          value: "none"
+        # There is no collector sidecar in this pod, so metrics are served on a
+        # local Prometheus endpoint.
+        - name: OTEL_SIDECAR
+          value: "false"
+        - name: OTEL_PROM_PORT
+          value: "2227"
+        # Optional configuration overrides (shown with defaults):
+        # - name: REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT
+        #   value: "false"
+        # - name: MM_CYCLE_MIN_DURATION_MS
+        #   value: "5000"
+        # - name: MMF_INVOCATION_TIMEOUT_SECS
+        #   value: "600"
+        # - name: RANDOM_MATCH_REJECT_PERCENT
+        #   value: "1"
+        # - name: OM_CORE_REQUEST_TIMEOUT_MS
+        #   value: "5000"
+        # Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL:
+        # - name: OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL
+        #   value: "500"
+        # - name: OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS
+        #   value: "10"
+        # - name: WAIT_FOR_BACKFILL_MMFS
+        #   value: "false"
+        # - name: MMQUEUE_TICKET_TTL_MS
+        #   value: "600000"
+        resources:
+          requests:
+            cpu: "1"
+            memory: 512Mi
+          limits:
+            memory: 1Gi
+        # GET / returns the director's status, and because the HTTP server only
+        # starts after the om-core connection check passes, readiness also means
+        # om-core was reachable at startup.
+        readinessProbe:
+          httpGet:
+            path: /
+            port: http
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          failureThreshold: 3
 ---
+# ClusterIP, not LoadBalancer, because /tickets, /tpc, and /debug/pprof have no
+# authentication and must not be exposed outside the cluster. To reach them
+# from a workstation, port-forward the service's port 80 to local port 8081:
+#   kubectl port-forward svc/matchmaker-example-service 8081:80
 apiVersion: v1
 kind: Service
 metadata:
@@ -34,5 +114,5 @@ spec:
     app: matchmaker-example
   ports:
   - port: 80
-    targetPort: 8080
-  type: LoadBalancer
+    targetPort: http
+  type: ClusterIP

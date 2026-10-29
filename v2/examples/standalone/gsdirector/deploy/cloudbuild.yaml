@@ -1,0 +1,160 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# To use this cloudbuild.yaml from its directory:
+#   gcloud builds submit --async --no-source
+#
+# Depending on how your project is set up, you may need to add the required Cloud Run role
+# (https://cloud.google.com/run/docs/reference/iam/roles) to the Cloud Build
+# service account using a gcloud command like this:
+#   gcloud projects add-iam-policy-binding $(gcloud config get project) \
+#     --member=serviceAccount:$(gcloud projects list --filter=$(gcloud config get project) --format="value(PROJECT_NUMBER)")-compute@developer.gserviceaccount.com \
+#     --role=roles/run.developer
+# You probably also need to allow Cloud Build to deploy using this application's custom Cloud Run _SERVICE_ACCOUNT:
+#   gcloud iam service-accounts add-iam-policy-binding \
+#     <_SERVICE_ACCOUNT>@$(gcloud config get project).iam.gserviceaccount.com \
+#     --role=roles/iam.serviceAccountUser \
+#     --member=serviceAccount:$(gcloud projects list --filter=$(gcloud config get project) --format="value(PROJECT_NUMBER)")-compute@developer.gserviceaccount.com
+
+substitutions:
+  # Cloud deploy vars
+  _JOB_NAME: gsdirector
+  _REGION: us-central1
+  _SERVICE_ACCOUNT: gsdirector-identity
+  # Artifact Registry repository and image names must be lowercase.
+  _ARTIFACT_REGISTRY_REPO: open-match-2-test
+  _GSDIRECTOR_IMAGE_NAME: om-standalone-gsdirector:0.0.1
+  _OTEL_SIDECAR_IMAGE: otel-collector-sidecar
+
+  # Application environment vars
+  # Must be om-core's exact Cloud Run service URL (https://...) because it is
+  # also the audience of the ID token used to call it.
+  _OM_CORE_ADDR: OM_CORE_CLOUD_RUN_URL
+  # MMF addresses are passed to om-core, which calls them; on Cloud Run they
+  # must include the https:// scheme so om-core authenticates with an ID token.
+  _SOLODUEL_ADDR: SOLODUEL_CLOUD_RUN_URL
+  _SOLODUEL_PORT: "443"
+  # The DEBUG MMF is opt-in: set this to its Cloud Run URL to enable it; "none"
+  # disables it.
+  _DEBUGMMF_ADDR: "none"
+  _DEBUGMMF_PORT: "443"
+  _GCP_PROJECT_ID: GCP_PROJECT_ID
+  # Existing Pub/Sub topic to publish assignments to; mmqueue instances
+  # subscribe to this same topic.
+  _ASSIGNMENT_TOPIC_ID: "om-demo-topic"
+
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: "Deploy:ingress internal, all egress vpc"
+    waitFor: ["-"]
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      # service config
+      - ${_JOB_NAME}
+      - --platform
+      - managed
+      - --region
+      - ${_REGION}
+      - --no-allow-unauthenticated
+      - --service-account
+      - ${_SERVICE_ACCOUNT}
+      - --no-cpu-throttling
+      - --execution-environment
+      - gen2
+      - --min-instances
+      - "1"
+      - --max-instances
+      - "1"
+
+      # Network config
+      - --network
+      - default
+      - --subnet
+      - default
+      - --vpc-egress
+      - all-traffic
+
+      # ingress config
+      - --ingress
+      - internal
+
+      # sidecar 'opentelemetry-collector' config
+      - --container
+      - opentelemetry-collector
+      - --image
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_OTEL_SIDECAR_IMAGE}'
+
+      # main 'gsdirector' container config
+      - --container
+      - gsdirector
+      - --image
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ARTIFACT_REGISTRY_REPO}/${_GSDIRECTOR_IMAGE_NAME}'
+      - --port
+      - "8080"
+      - --memory
+      - 1024Mi
+
+      # env vars for 'gsdirector'
+      - --update-env-vars
+      - "OM_CORE_ADDR=${_OM_CORE_ADDR}"
+      - --update-env-vars
+      - "SOLODUEL_ADDR=${_SOLODUEL_ADDR}"
+      - --update-env-vars
+      - "SOLODUEL_PORT=${_SOLODUEL_PORT}"
+      - --update-env-vars
+      - "DEBUGMMF_ADDR=${_DEBUGMMF_ADDR}"
+      - --update-env-vars
+      - "DEBUGMMF_PORT=${_DEBUGMMF_PORT}"
+      - --update-env-vars
+      - "GCP_PROJECT_ID=${_GCP_PROJECT_ID}"
+      - --update-env-vars
+      - "ASSIGNMENT_TOPIC_ID=${_ASSIGNMENT_TOPIC_ID}"
+      # Optional environment variable overrides (shown with defaults; see ../README.md for descriptions):
+      # - --update-env-vars
+      # - "LOGGING_FORMAT=json"
+      # - --update-env-vars
+      # - "LOGGING_LEVEL=info"
+      # - --update-env-vars
+      # - "LOG_CALLER=false"
+      # - --update-env-vars
+      # - "OTEL_SIDECAR=true"
+      # - --update-env-vars
+      # - "OTEL_PROM_PORT=2225"
+      # - --update-env-vars
+      # - "ASSIGNMENT_DISTRIBUTION_PATH=pubsub"
+      # - --update-env-vars
+      # - "NUM_MM_CYCLES=2147483647"
+      # - --update-env-vars
+      # - "MM_CYCLE_MIN_DURATION_MS=5000"
+      # - --update-env-vars
+      # - "MMF_INVOCATION_TIMEOUT_SECS=600"
+      # - --update-env-vars
+      # - "NUM_CONSECUTIVE_EMPTY_MM_CYCLES_BEFORE_QUIT=2147483647"
+      # - --update-env-vars
+      # - "ASSIGNMENT_TTL_MS=1200000"
+      # - --update-env-vars
+      # - "REJECT_MATCHES_ON_DEACTIVATION_TIMEOUT=false"
+      # - --update-env-vars
+      # - "WAIT_FOR_BACKFILL_MMFS=false"
+      # - --update-env-vars
+      # - "RANDOM_MATCH_REJECT_PERCENT=1"
+      # - --update-env-vars
+      # - "OM_CORE_REQUEST_TIMEOUT_MS=5000"
+      # Must be <= om-core's OM_MAX_STATE_UPDATES_PER_CALL:
+      # - --update-env-vars
+      # - "OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL=500"
+      # - --update-env-vars
+      # - "OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS=10"

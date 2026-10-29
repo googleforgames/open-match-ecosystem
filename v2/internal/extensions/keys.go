@@ -29,4 +29,8 @@ const (
 	// https://agones.dev/site/docs/integration-patterns/high-density-gameservers/
 	AgonesGSReadyKey      = "agones.dev/sdk-gs-session-ready"
 	AgonesGSReadyCountKey = "open-match.dev/agones-game-server-ready-count"
+
+	// MatchDeactivationTimeoutKey is the key in the match extensions field
+	// indicating that ticket deactivation local cache replication timed out.
+	MatchDeactivationTimeoutKey = "deactivation_timeout"
 )

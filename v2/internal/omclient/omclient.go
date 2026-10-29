@@ -17,13 +17,15 @@
 package omclient
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,17 +36,242 @@ import (
 	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
 	"google.golang.org/api/idtoken"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	spb "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+const (
+	// defaultRequestTimeout bounds each attempt of a unary om-core call
+	// (CreateTicket, ActivateTickets, DeactivateTickets, ValidateConnection) when
+	// OM_CORE_REQUEST_TIMEOUT_MS is unset or non-positive. It is applied per
+	// attempt with a context timeout rather than through http.Client.Timeout,
+	// because the director shares one http.Client between these unary calls and
+	// the long-lived InvokeMatchmakingFunctions stream, so that client cannot
+	// have an overall timeout. Without a per-attempt bound, a black-holed
+	// connection would hold an activation slot (see
+	// OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS) forever.
+	defaultRequestTimeout = 5 * time.Second
+
+	// tokenMintTimeout bounds how long a request waits for a Cloud Run ID token.
+	// Minting talks to the metadata server, so if that is slow, requests fail
+	// fast (and their callers retry) instead of hanging.
+	tokenMintTimeout = 10 * time.Second
+
+	// defaultMaxConcurrentActivationCalls is the maximum number of concurrent
+	// activation batch calls when OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS is
+	// unset or non-positive.
+	defaultMaxConcurrentActivationCalls = 10
 )
 
 var MMFsComplete = errors.New("Open Match HTTP client detected that the stream of matches from OM was complete and cancelled the context")
 
+// ActivationResult reports the activation outcome for a single ticket ID.
+type ActivationResult struct {
+	TicketId string
+	Err      error
+}
+
+type activationTypeContextKey struct{}
+
+// WithActivationType returns a copy of ctx labelled with the activation type
+// (for example "activate" for a ticket's first activation, or "reactivate" when
+// a director returns tickets from a rejected match to the pool).
+// ActivateTicketsWithResults includes the label in its logs so the two kinds of
+// activation can be told apart.
+func WithActivationType(ctx context.Context, activationType string) context.Context {
+	return context.WithValue(ctx, activationTypeContextKey{}, activationType)
+}
+
+type tokenSourceFactory func(ctx context.Context, audience string) (oauth2.TokenSource, error)
+
+func defaultTokenSourceFactory(ctx context.Context, audience string) (oauth2.TokenSource, error) {
+	return idtoken.NewTokenSource(ctx, audience)
+}
+
+// audienceMintingSource creates a new ID token source for its audience every
+// time it is asked for a token. It is always wrapped in an
+// oauth2.ReuseTokenSource, which caches the token until it expires and makes
+// concurrent callers share a single mint instead of each minting their own.
+type audienceMintingSource struct {
+	factory  tokenSourceFactory
+	audience string
+}
+
+func (m audienceMintingSource) Token() (*oauth2.Token, error) {
+	src, err := m.factory(context.Background(), m.audience)
+	if err != nil {
+		return nil, fmt.Errorf("Cloud Run service account authentication requires token source, but couldn't get one. idtoken.NewTokenSource: %w", err)
+	}
+	tok, err := src.Token()
+	if err != nil {
+		return nil, fmt.Errorf("Cloud Run service account authentication requires a token, but couldn't get one. TokenSource.Token: %w", err)
+	}
+	return tok, nil
+}
+
+type audienceTokenEntry struct {
+	source oauth2.TokenSource
+}
+
+func newAudienceTokenEntry(factory tokenSourceFactory, audience string) *audienceTokenEntry {
+	return &audienceTokenEntry{
+		source: oauth2.ReuseTokenSource(nil, audienceMintingSource{
+			factory:  factory,
+			audience: audience,
+		}),
+	}
+}
+
+// oidcTokenCache holds one caching token source per audience (om-core URL).
+// Its mutex only guards the map; tokens are minted outside the lock, so one
+// slow mint for an audience never blocks requests to other audiences.
+type oidcTokenCache struct {
+	mu      sync.Mutex
+	factory tokenSourceFactory
+	entries map[string]*audienceTokenEntry
+}
+
+func newOIDCTokenCache(factory tokenSourceFactory) *oidcTokenCache {
+	return &oidcTokenCache{
+		factory: factory,
+		entries: make(map[string]*audienceTokenEntry),
+	}
+}
+
+func (c *oidcTokenCache) lookup(ctx context.Context, audience string) (*oauth2.Token, *audienceTokenEntry, error) {
+	c.mu.Lock()
+	entry, ok := c.entries[audience]
+	if !ok {
+		entry = newAudienceTokenEntry(c.factory, audience)
+		c.entries[audience] = entry
+	}
+	c.mu.Unlock()
+
+	tok, err := fetchTokenBounded(ctx, entry.source)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tok, entry, nil
+}
+
+func (c *oidcTokenCache) refresh(ctx context.Context, audience string, rejected *audienceTokenEntry) (*oauth2.Token, error) {
+	c.mu.Lock()
+	entry, ok := c.entries[audience]
+	if !ok || entry == rejected {
+		entry = newAudienceTokenEntry(c.factory, audience)
+		c.entries[audience] = entry
+	}
+	c.mu.Unlock()
+
+	return fetchTokenBounded(ctx, entry.source)
+}
+
+// fetchTokenBounded fetches a token from src while bounding how long the caller
+// waits. oauth2 token sources take no context, so the call runs in its own
+// goroutine; if the mint hangs, that goroutine finishes whenever the mint does,
+// and later requests share its result through the reusable token source.
+func fetchTokenBounded(ctx context.Context, src oauth2.TokenSource) (*oauth2.Token, error) {
+	mintCtx, cancel := context.WithTimeout(ctx, tokenMintTimeout)
+	defer cancel()
+
+	type tokenOutcome struct {
+		tok *oauth2.Token
+		err error
+	}
+	resCh := make(chan tokenOutcome, 1)
+	go func() {
+		tok, err := src.Token()
+		resCh <- tokenOutcome{tok: tok, err: err}
+	}()
+
+	select {
+	case res := <-resCh:
+		return res.tok, res.err
+	case <-mintCtx.Done():
+		return nil, fmt.Errorf("timed out waiting for a Cloud Run ID token: %w", mintCtx.Err())
+	}
+}
+
+// RestfulOMGrpcClient calls om-core's gRPC API through its grpc-gateway
+// HTTP/JSON endpoints and should be constructed with New.
+//
+// Authentication:
+//   - When running on Cloud Run (detected by the K_REVISION environment
+//     variable, which Cloud Run always sets and which reaches the client
+//     through Cfg), every request carries a Google-signed ID token for the
+//     om-core service, so a Cloud Run om-core that requires authentication
+//     accepts it.
+//   - Elsewhere (local runs, GKE) no token is sent.
+//   - The token's audience is OM_CORE_ADDR, with any trailing "/" ignored. On
+//     Cloud Run, OM_CORE_ADDR must therefore be om-core's exact https service
+//     URL, and the calling service account needs the Cloud Run Invoker role on
+//     it.
 type RestfulOMGrpcClient struct {
-	Client      *http.Client
-	Log         *logrus.Logger
-	Cfg         *viper.Viper
-	tokenSource oauth2.TokenSource
+	Client     *http.Client
+	Log        *logrus.Logger
+	Cfg        *viper.Viper
+	tokenCache *oidcTokenCache
+}
+
+// New constructs a RestfulOMGrpcClient initialized with a concurrency-safe per-audience OIDC token cache.
+func New(cfg *viper.Viper, log *logrus.Logger, client *http.Client) *RestfulOMGrpcClient {
+	return &RestfulOMGrpcClient{
+		Client:     client,
+		Log:        log,
+		Cfg:        cfg,
+		tokenCache: newOIDCTokenCache(defaultTokenSourceFactory),
+	}
+}
+
+func (rc *RestfulOMGrpcClient) requestTimeout() time.Duration {
+	if ms := rc.Cfg.GetInt("OM_CORE_REQUEST_TIMEOUT_MS"); ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return defaultRequestTimeout
+}
+
+// isRetryableStatus reports whether an om-core error response is worth retrying
+// (the server was overloaded or temporarily unavailable, rather than rejecting
+// the request itself). grpc-gateway maps gRPC codes to HTTP statuses
+// (Unavailable to 503, ResourceExhausted to 429, Internal to 500,
+// DeadlineExceeded to 504, Aborted to 409, InvalidArgument to 400), and the
+// body carries the gRPC status, which is checked too.
+func isRetryableStatus(httpStatus int, body []byte) bool {
+	if httpStatus == http.StatusRequestTimeout || httpStatus == http.StatusTooManyRequests {
+		return true
+	}
+	if httpStatus >= http.StatusInternalServerError && httpStatus != http.StatusNotImplemented {
+		return true
+	}
+	grpcCode, _, _ := parseActivationErrorBody(body)
+	switch grpcCode {
+	case codes.Unavailable, codes.ResourceExhausted, codes.Aborted, codes.DeadlineExceeded:
+		return true
+	default:
+		return false
+	}
+}
+
+// statusErrorFromJSON decodes a google.rpc.Status (as written by grpc-gateway)
+// into a gRPC status error, preserving any error details, and falls back to
+// codes.Unknown with the raw body as the message if it cannot be decoded.
+func statusErrorFromJSON(body []byte, fallbackMsg string) error {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 {
+		var rpcStatus spb.Status
+		unmarshalOpts := protojson.UnmarshalOptions{DiscardUnknown: true}
+		if err := unmarshalOpts.Unmarshal(trimmed, &rpcStatus); err == nil && rpcStatus.GetCode() != 0 {
+			return status.ErrorProto(&rpcStatus)
+		}
+	}
+	msg := string(trimmed)
+	if msg == "" {
+		msg = fallbackMsg
+	}
+	return status.Error(codes.Unknown, msg)
 }
 
 // CreateTicket Example
@@ -53,8 +280,19 @@ type RestfulOMGrpcClient struct {
 // inventory, etc), then call Open Match core on the client's behalf to make a
 // matchmaking ticket. In this sense, Open Match sees your platform services
 // layer as a 'proxy' for the player's game client.
+//
+// CreateTicket makes a single attempt, bounded by OM_CORE_REQUEST_TIMEOUT_MS,
+// and is meant to be called with backoff.Retry. Errors that retrying cannot fix
+// are wrapped in backoff.Permanent; transport errors, timeouts, 429s and 5xx
+// responses are returned as-is so they get retried.
+//
+// Retrying CreateTicket is a trade-off: om-core has no idempotency key, so if
+// an attempt times out after om-core has already stored the ticket, the retry
+// creates a second ticket. The duplicate is never activated, so it is never
+// matched, and om-core expires it after its ticket TTL, but om-core's
+// ticket-creation count will be slightly higher than the caller's.
 func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Ticket) (string, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(ctx, rc.requestTimeout())
 	defer cancel()
 
 	logger := rc.Log.WithFields(logrus.Fields{
@@ -62,17 +300,12 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 		"operation": "proxy_CreateTicket",
 	})
 
-	// Update metrics
-	//createdTicketCounter.Add(ctx, 1)
-
 	// Put the ticket into open match CreateTicket request protobuf message.
 	reqPb := &pb.CreateTicketRequest{Ticket: ticket}
 	resPb := &pb.CreateTicketResponse{}
-	var err error
-	var buf []byte
 
 	// Marshal request into json
-	buf, err = protojson.Marshal(reqPb)
+	buf, err := protojson.Marshal(reqPb)
 	if err != nil {
 		// Mark as a permanent error so the backoff library doesn't retry this (invalid input)
 		err := backoff.Permanent(err)
@@ -83,38 +316,23 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 	}
 
 	// HTTP version of the gRPC CreateTicket() call
-	resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets", buf)
+	resp, err := rc.Post(ctx, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets", buf)
+	if err != nil {
+		reqErr := fmt.Errorf("CreateTicket request failed: %w", err)
+		logger.WithFields(logrus.Fields{
+			"CreateTicketsRequest": reqPb,
+		}).Error(reqErr)
+		return "", reqErr
+	}
 
 	// Include headers in structured logging when using trace log level [slow]
 	headerFields := logrus.Fields{}
-	if logrus.IsLevelEnabled(logrus.TraceLevel) {
+	if rc.Log.IsLevelEnabled(logrus.TraceLevel) {
 		for key, value := range resp.Header {
 			headerFields[key] = value
 		}
 	}
 	logger = logger.WithFields(headerFields)
-
-	// Check for failures
-	if resp != nil && resp.StatusCode != http.StatusOK { // HTTP error code
-		err := fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
-		logger.WithFields(logrus.Fields{
-			"CreateTicketsRequest": reqPb,
-		}).Errorf("CreateTicket failed: %v", err)
-		//TODO: switch resp.Header?
-		resp.Body.Close() // make sure the body is closed.
-		return "", err
-	}
-	if err != nil { // HTTP library error
-		// ERRO[59639] CreateTicket failed: Post "http://localhost:8080/tickets": dial tcp [::1]:8080: connect: cannot assign requested address
-		logger.WithFields(logrus.Fields{
-			"CreateTicketsRequest": reqPb,
-		}).Errorf("CreateTicket failed: %v", err)
-		// Shouldn't have a response but if somehow there is one, make sure it is closed.
-		if resp != nil {
-			resp.Body.Close()
-		}
-		return "", err
-	}
 
 	// Read & close HTTP response body
 	body, err := readAllBody(*resp, logger)
@@ -126,6 +344,18 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 			"error":      err,
 		}).Errorf("cannot read http response body")
 		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		statusErr := statusErrorFromJSON(body, http.StatusText(resp.StatusCode))
+		callErr := fmt.Errorf("CreateTicket failed: HTTP %d: %w", resp.StatusCode, statusErr)
+		logger.WithFields(logrus.Fields{
+			"CreateTicketsRequest": reqPb,
+		}).Error(callErr)
+		if !isRetryableStatus(resp.StatusCode, body) {
+			return "", backoff.Permanent(callErr)
+		}
+		return "", callErr
 	}
 
 	// Success, unmarshal json back into protobuf
@@ -149,146 +379,337 @@ func (rc *RestfulOMGrpcClient) CreateTicket(ctx context.Context, ticket *pb.Tick
 
 	// Successful ticket creation
 	logger.Tracef("CreateTicket %v complete", resPb.TicketId)
-	return resPb.TicketId, err
+	return resPb.TicketId, nil
 }
 
-// ActivateTickets takes a channel of ticket ids for tickets awaiting activation,
-// and breaks them into batches of the size defined in
-// rc.cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL") (see
-// open-match.dev/core/internal/config for limits on how many actions you can
-// request in a single API call, this needs to use the same value).
-func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToActivate chan string) {
+func parseActivationErrorBody(body []byte) (codes.Code, map[string]string, bool) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return codes.Unknown, nil, false
+	}
+
+	var rpcStatus spb.Status
+	unmarshalOpts := protojson.UnmarshalOptions{DiscardUnknown: true}
+	if err := unmarshalOpts.Unmarshal(body, &rpcStatus); err != nil {
+		return codes.Unknown, nil, false
+	}
+
+	st := status.FromProto(&rpcStatus)
+	var perTicketErrors map[string]string
+	for _, detail := range st.Details() {
+		badReq, ok := detail.(*errdetails.BadRequest)
+		if !ok || badReq == nil {
+			continue
+		}
+		for _, violation := range badReq.GetFieldViolations() {
+			if violation == nil {
+				continue
+			}
+			ticketID := strings.TrimPrefix(violation.GetField(), "ticket_id/")
+			if perTicketErrors == nil {
+				perTicketErrors = make(map[string]string)
+			}
+			perTicketErrors[ticketID] = violation.GetDescription()
+		}
+	}
+
+	return st.Code(), perTicketErrors, len(perTicketErrors) > 0
+}
+
+func deduplicateTicketIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ids))
+	var unique []string
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	return unique
+}
+
+// ActivateTickets delegates to ActivateTicketsWithResults with a nil results channel.
+func (rc *RestfulOMGrpcClient) ActivateTickets(ctx context.Context, ticketIdsToActivate <-chan string) {
+	rc.ActivateTicketsWithResults(ctx, ticketIdsToActivate, nil)
+}
+
+// ActivateTicketsWithResults takes a channel of ticket IDs awaiting activation,
+// batches them up to OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL or 250ms, calls
+// /tickets:activate with per-ticket status parsing and subset retries, and
+// reports per-ticket outcomes to resultsChan when non-nil. At most
+// OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS batches are in flight at once.
+func (rc *RestfulOMGrpcClient) ActivateTicketsWithResults(ctx context.Context, ticketIdsToActivate <-chan string, resultsChan chan<- ActivationResult) {
+	caller := "unspecified"
+	if label, ok := ctx.Value(activationTypeContextKey{}).(string); ok && label != "" {
+		caller = label
+	}
 	logger := rc.Log.WithFields(logrus.Fields{
 		"component": "open_match_client",
 		"operation": "proxy_ActivateTickets",
-		"caller": func() string {
-			// Quick in-line function to grab information the calling function
-			// put into the context and propogate it to the logs
-			ts, ok := ctx.Value("activationType").(string)
-			if !ok {
-				rc.Log.Error("unable to get caller type from context")
-				return "undefined"
-			}
-			return ts
-		}(),
+		"caller":    caller,
 	})
 
-	// batching asynchronous goroutine. Processes incoming ticket ids into a
-	// batch of max size OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL, or until the
-	// deadline is reached, whichever comes first, then starts a new batch as long
-	// as the incoming channel has not been closed.
+	sendResult := func(ticketID string, err error) {
+		if resultsChan == nil {
+			return
+		}
+		select {
+		case resultsChan <- ActivationResult{TicketId: ticketID, Err: err}:
+		case <-ctx.Done():
+		}
+	}
+
 	batchChan := make(chan []string)
 	go func() {
 		bLogger := logger.WithFields(logrus.Fields{
 			"suboperation": "create_batches",
 		})
 
-		// As long as the channel is not closed, keep reading batches from it.
+		// This value must be no larger than om-core's OM_MAX_STATE_UPDATES_PER_CALL,
+		// because om-core rejects larger requests with InvalidArgument and every
+		// full batch would fail permanently.
+		maxBatchSize := 500
+		if configuredMax := rc.Cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL"); configuredMax > 0 {
+			maxBatchSize = configuredMax
+		}
+
 		numBatches := 0
 		senderActive := true
-		var tid string
 		for senderActive {
-
-			// Wait no longer than deadline for a batch to be created and sent for processing
 			deadline := time.NewTimer(250 * time.Millisecond)
 			activationBatch := make([]string, 0)
 			batchComplete := false
 
-			// Loop through incoming ticket ids, until batch limit is reached or deadline is exceeded
 			for !batchComplete {
-
 				select {
-				case tid, senderActive = <-ticketIdsToActivate:
-					activationBatch = append(activationBatch, tid)
-					if len(activationBatch) == rc.Cfg.GetInt("OM_CORE_MAX_UPDATES_PER_ACTIVATION_CALL") {
+				case <-ctx.Done():
+					senderActive = false
+					batchComplete = true
+				case ticketId, ok := <-ticketIdsToActivate:
+					if !ok {
+						senderActive = false
+						batchComplete = true
+						break
+					}
+					activationBatch = append(activationBatch, ticketId)
+					if len(activationBatch) >= maxBatchSize {
 						batchComplete = true
 					}
 				case <-deadline.C:
 					batchComplete = true
 				}
 			}
+			deadline.Stop()
 
-			// Send the batch to be sent in a single call to om-core
-			numBatches++
 			if len(activationBatch) > 0 {
+				numBatches++
 				bLogger.Tracef("queueing batch of %v ticket ids to send for activation", len(activationBatch))
-				batchChan <- activationBatch
+				select {
+				case batchChan <- activationBatch:
+				case <-ctx.Done():
+					senderActive = false
+				}
 			}
-
 		}
 
-		// All done with creating batches.
 		bLogger.Tracef("processed %v batches before the sender stopped sending ticket ids", numBatches)
 		close(batchChan)
 	}()
 
-	// Loop that sends all batches made by the above goroutine to om-core
+	maxConcurrent := defaultMaxConcurrentActivationCalls
+	if configuredConc := rc.Cfg.GetInt("OM_CORE_MAX_CONCURRENT_ACTIVATION_CALLS"); configuredConc > 0 {
+		maxConcurrent = configuredConc
+	}
+	// When all slots are in use, the loop below stops reading from batchChan,
+	// which blocks the batching goroutine, which in turn stops draining the
+	// caller's ticket-ID channel. That propagates backpressure to the caller
+	// instead of letting in-flight activation calls grow without bound when
+	// om-core slows down.
+	sem := make(chan struct{}, maxConcurrent)
+
 	var activationWg sync.WaitGroup
 	for batch := range batchChan {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			continue
+		}
 
-		// Kick off activation in a goroutine, so if there are multiple batches
-		// all calls are made concurrently.
+		activationWg.Add(1)
 		go func(thisBatch []string) {
-
-			// Track this goroutine
-			activationWg.Add(1)
 			defer activationWg.Done()
+			defer func() { <-sem }()
 
-			// Generate request protobuffer to send to activate tickets endpoint
-			reqPb := &pb.ActivateTicketsRequest{TicketIds: thisBatch}
-			var err error
-
-			// Marshal request into json
-			req, err := protojson.Marshal(reqPb)
-			if err != nil {
-				logger.WithFields(logrus.Fields{
-					"pb_message": "ActivateTicketsRequest",
-				}).Errorf("cannot marshal protobuf to json")
+			pendingBatch := deduplicateTicketIDs(slices.Clone(thisBatch))
+			if len(pendingBatch) == 0 {
+				return
 			}
 
-			// HTTP version of the gRPC ActivateTickets() call that we want to retry with exponential backoff and jitter
+			reqTimeout := rc.requestTimeout()
+
 			activateTicketCall := func() error {
-				logger.Tracef("ActivateTicket call with %v tickets: %v...", len(thisBatch), thisBatch[0])
-				resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets:activate", req)
-				defer func(resp *http.Response) {
-					if resp != nil {
-						resp.Body.Close()
-					}
-				}(resp)
-				// TODO: In reality, the error has details fields, telling us which ticket couldn't
-				// be activated, but we're not processing those or passing them on yet, we just act as
-				// though all activations succeeded or all activations failed.
+				if len(pendingBatch) == 0 {
+					return nil
+				}
+
+				reqPb, err := protojson.Marshal(&pb.ActivateTicketsRequest{TicketIds: pendingBatch})
+				if err != nil {
+					logger.WithFields(logrus.Fields{
+						"pb_message": "ActivateTicketsRequest",
+					}).Errorf("cannot marshal protobuf to json")
+					return backoff.Permanent(err)
+				}
+
+				// Each attempt is bounded so a black-holed connection cannot hold
+				// this activation slot forever.
+				attemptCtx, cancelAttempt := context.WithTimeout(ctx, reqTimeout)
+				defer cancelAttempt()
+
+				logger.Tracef("ActivateTicket call with %v tickets: %v...", len(pendingBatch), pendingBatch[0])
+				resp, err := rc.Post(attemptCtx, rc.Cfg.GetString("OM_CORE_ADDR"), "/tickets:activate", reqPb)
+				var respBody []byte
+				if resp != nil && resp.Body != nil {
+					respBody, _ = io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+				}
 				if err != nil {
 					logger.Errorf("ActivateTickets attempt failed: %v", err)
 					return err
-				} else if resp != nil && resp.StatusCode != http.StatusOK { // HTTP error code
-					err = fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
-					logger.Errorf("ActivateTickets attempt failed: %v", err)
-					return err
 				}
-				return nil
+
+				if resp.StatusCode == http.StatusOK {
+					for _, id := range pendingBatch {
+						sendResult(id, nil)
+					}
+					pendingBatch = nil
+					return nil
+				}
+
+				grpcCode, ticketErrs, hasTicketDetails := parseActivationErrorBody(respBody)
+				httpErr := fmt.Errorf("%s (%d)", http.StatusText(resp.StatusCode), resp.StatusCode)
+
+				switch {
+				case hasTicketDetails && (resp.StatusCode == http.StatusBadRequest || grpcCode == codes.InvalidArgument):
+					var retrySlice []string
+					var permFailure error
+					for _, id := range pendingBatch {
+						desc, failed := ticketErrs[id]
+						if !failed {
+							sendResult(id, nil)
+							continue
+						}
+						if strings.Contains(desc, "Unable to update ticket") || strings.Contains(desc, "code "+"= Internal") {
+							retrySlice = append(retrySlice, id)
+							continue
+						}
+						permErr := fmt.Errorf("permanent ticket activation failure for %s: %s", id, desc)
+						permFailure = permErr
+						logger.Errorf("ActivateTickets permanent failure for ticket %s: %s", id, desc)
+						sendResult(id, permErr)
+					}
+					pendingBatch = retrySlice
+					if len(pendingBatch) > 0 {
+						logger.Errorf("ActivateTickets attempt had transient failures for %d tickets: %v", len(pendingBatch), httpErr)
+						return httpErr
+					}
+					if permFailure != nil {
+						return backoff.Permanent(permFailure)
+					}
+					return backoff.Permanent(httpErr)
+
+				case !hasTicketDetails && (resp.StatusCode == http.StatusBadRequest || grpcCode == codes.InvalidArgument):
+					// Callers get the plain error; the Permanent wrapper is only a signal to RetryNotify.
+					logger.Errorf("ActivateTickets permanent failure: %v", httpErr)
+					for _, id := range pendingBatch {
+						sendResult(id, httpErr)
+					}
+					pendingBatch = nil
+					return backoff.Permanent(httpErr)
+
+				case hasTicketDetails && (resp.StatusCode == http.StatusInternalServerError || grpcCode == codes.Internal):
+					var retrySlice []string
+					for _, id := range pendingBatch {
+						if _, failed := ticketErrs[id]; !failed {
+							sendResult(id, nil)
+						} else {
+							retrySlice = append(retrySlice, id)
+						}
+					}
+					pendingBatch = retrySlice
+					if len(pendingBatch) == 0 {
+						return nil
+					}
+					logger.Errorf("ActivateTickets attempt failed for %d tickets: %v", len(pendingBatch), httpErr)
+					return httpErr
+
+				case !isRetryableStatus(resp.StatusCode, respBody):
+					// Other client errors (401/403 after Do's token handling, 404 wrong
+					// OM_CORE_ADDR, 413 batch too large) fail the same way on every retry.
+					logger.Errorf("ActivateTickets permanent failure: %v", httpErr)
+					for _, id := range pendingBatch {
+						sendResult(id, httpErr)
+					}
+					pendingBatch = nil
+					return backoff.Permanent(httpErr)
+
+				default:
+					logger.Errorf("ActivateTickets attempt failed: %v", httpErr)
+					return httpErr
+				}
 			}
 
-			// Try to call ActivateTickets() with retries for up to 5 seconds.
-			err = backoff.RetryNotify(
+			// Retry for long enough that an attempt that hit the per-attempt
+			// timeout still gets retried; activation is idempotent in om-core,
+			// so retrying a call that actually succeeded is safe.
+			bOff := backoff.WithContext(
+				backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(3*reqTimeout)),
+				ctx,
+			)
+			err := backoff.RetryNotify(
 				activateTicketCall,
-				backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(5*time.Second)),
+				bOff,
 				func(err error, bo time.Duration) {
-					logger.Errorf("ActivateTicket temporary failure (backoff for %v): %v", err, bo)
+					logger.Errorf("ActivateTicket temporary failure (backoff for %v): %v", bo, err)
 				},
 			)
 			if err != nil {
 				logger.Errorf("ActivateTickets failed: %v", err)
+				for _, id := range pendingBatch {
+					sendResult(id, err)
+				}
 			}
 			logger.Trace("ActivateTickets complete")
 		}(batch)
 	}
 
-	// wait for all outstanding asynchronous calls to om-core's ActivateTickets() endpoint to complete
 	activationWg.Wait()
 }
 
-func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, reqPb *pb.MmfRequest, respChan chan *pb.StreamedMmfResponse) {
+// streamedGatewayEnvelope is one newline-delimited JSON message from om-core's
+// grpc-gateway server-streaming endpoint, either a result message or a final
+// error message carrying a google.rpc.Status when the RPC ends with an error.
+type streamedGatewayEnvelope struct {
+	Result json.RawMessage `json:"result"`
+	Error  json.RawMessage `json:"error"`
+}
+
+// InvokeMatchmakingFunctions calls om-core's InvokeMatchmakingFunctions RPC
+// over the HTTP grpc-gateway and sends every streamed response to respChan
+// exactly as om-core returned it, including responses whose Match has no
+// tickets and responses with no Match at all. The channel is always closed
+// before return. The returned error reports transport, marshalling or decoding
+// failures, a non-200 HTTP response (as om-core's gRPC status), or a final
+// error message at the end of the stream (how om-core reports that one or more
+// MMFs failed, returned as that gRPC status with details, with matches received
+// before it still delivered). This lets callers tell "the call failed" apart
+// from "no matches were made".
+func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, req *pb.MmfRequest, respChan chan *pb.StreamedMmfResponse) error {
 	// Make sure the output channel always gets closed when this function is finished.
 	defer close(respChan)
 
@@ -299,152 +720,216 @@ func (rc *RestfulOMGrpcClient) InvokeMatchmakingFunctions(ctx context.Context, r
 	})
 
 	// Have to cancel the context to tell the om-core server we're done reading from the stream.
-	ctx, cancel := context.WithCancelCause(ctx)
+	streamCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(MMFsComplete)
 
 	// Marshal protobuf request to JSON for grpc-gateway HTTP call
-	req, err := protojson.Marshal(reqPb)
+	reqPb, err := protojson.Marshal(req)
 	if err != nil {
+		marshalErr := fmt.Errorf("cannot marshal MmfRequest to json: %w", err)
 		logger.WithFields(logrus.Fields{
 			"pb_message": "MmfRequest",
-		}).Errorf("cannot marshal protobuf to json")
-	} else {
-		logger.Trace("Marshalled MmfRequest protobuf message to JSON")
+		}).Error(marshalErr)
+		return marshalErr
 	}
+	logger.Trace("Marshalled MmfRequest protobuf message to JSON")
 
 	// HTTP version of gRPC InvokeMatchmakingFunctions() call
 	logger.Trace("Calling InvokeMatchmakingFunctions()")
-	resp, err := rc.Post(ctx, logger, rc.Cfg.GetString("OM_CORE_ADDR"), "/matches:fetch", req)
+	resp, err := rc.Post(streamCtx, rc.Cfg.GetString("OM_CORE_ADDR"), "/matches:fetch", reqPb)
 	if err != nil {
-		logger.Errorf("InvokeMatchmakingFunction call failed: %v", err)
-	} else if resp != nil && resp.StatusCode != http.StatusOK {
-		logger.Errorf("InvokeMatchmakingFunction call failed: %v", resp.StatusCode)
-	} else {
-		logger.Tracef("InvokeMatchmakingFunction call successful: %v", resp.StatusCode)
+		if resp != nil && resp.Body != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		callErr := fmt.Errorf("InvokeMatchmakingFunctions call failed: %w", err)
+		logger.Error(callErr)
+		return callErr
+	}
+	if resp == nil || resp.Body == nil {
+		nilErr := errors.New("InvokeMatchmakingFunctions call failed: nil response")
+		logger.Error(nilErr)
+		return nilErr
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		statusErr := statusErrorFromJSON(body, http.StatusText(resp.StatusCode))
+		logger.Errorf("InvokeMatchmakingFunctions call failed with HTTP %d: %v", resp.StatusCode, statusErr)
+		return statusErr
+	}
+	defer resp.Body.Close()
 
-		// Process the result stream
-		for {
-			var resPb *pb.StreamedMmfResponse
-			// Retrieve JSON-formatted protobuf from response body
-			var msg string
-			_, err := fmt.Fscanf(resp.Body, "%s\n", &msg)
+	logger.Tracef("InvokeMatchmakingFunctions call successful: %v", resp.StatusCode)
 
-			// Validate response before processing
-			if err == io.EOF {
-				break // End of stream; done!
-			}
-			if err != nil {
-				logger.Errorf("Error reading stream, closing: %v", err)
-				break
-			}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+	unmarshalOpts := protojson.UnmarshalOptions{DiscardUnknown: true}
 
-			// Easy to miss: grpc-gateway returns your result inside a
-			// overarching JSON enclosure under the key 'result', so
-			// the actual text we need to pass to protojson.Unmarshal
-			// needs to omit the top level JSON object. Rather than
-			// marshal the text to json (which is slow), we just use
-			// string trimming functions.
-			trimmedMsg := strings.TrimSuffix(strings.TrimPrefix(msg, `{"result":`), "}")
-			logger.WithFields(logrus.Fields{
-				"pb_message": "StreamedMmfResponse",
-			}).Tracef("HTTP response JSON body version of StreamedMmfResponse received")
+	var streamErr error
+	var decodeErrCount int
 
-			// Unmarshal json back into protobuf
-			resPb = &pb.StreamedMmfResponse{}
-			err = protojson.Unmarshal([]byte(trimmedMsg), resPb)
-			if err != nil {
-				logger.WithFields(logrus.Fields{
-					"pb_message":    "StreamedMmfResponse",
-					"http_response": trimmedMsg,
-					"error":         err,
-				}).Errorf("cannot unmarshal http response body back into protobuf")
-				continue
-			} else {
-				logger.Trace("Successfully unmarshalled HTTP response JSON body back into StreamedMmfResponse protobuf message")
-			}
-
-			if resPb.GetMatch() == nil {
-				logger.Trace("StreamedMmfResponse protobuf was empty!")
-				continue // Loop again to get the next streamed response
-			}
-
-			// Send back the streamed responses as we get them
-			logger.Trace("StreamedMmfResponse protobuf exists and is not empty")
-			respChan <- resPb
-
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
 		}
 
-		// Close response body
-		resp.Body.Close()
+		var envelope streamedGatewayEnvelope
+		if err := json.Unmarshal(line, &envelope); err != nil {
+			decodeErrCount++
+			logger.WithFields(logrus.Fields{
+				"pb_message":    "StreamedMmfResponse",
+				"http_response": string(line),
+				"error":         err,
+			}).Errorf("cannot unmarshal http response envelope from json")
+			continue
+		}
+
+		trimmedErr := bytes.TrimSpace(envelope.Error)
+		if len(trimmedErr) > 0 && string(trimmedErr) != "null" {
+			streamErr = statusErrorFromJSON(trimmedErr, "InvokeMatchmakingFunctions stream ended with an error")
+			logger.Errorf("InvokeMatchmakingFunctions stream error: %v", streamErr)
+			continue
+		}
+
+		trimmedResult := bytes.TrimSpace(envelope.Result)
+		if len(trimmedResult) == 0 || string(trimmedResult) == "null" {
+			continue
+		}
+
+		respPb := &pb.StreamedMmfResponse{}
+		if err := unmarshalOpts.Unmarshal(trimmedResult, respPb); err != nil {
+			decodeErrCount++
+			logger.WithFields(logrus.Fields{
+				"pb_message":    "StreamedMmfResponse",
+				"http_response": string(trimmedResult),
+				"error":         err,
+			}).Errorf("cannot unmarshal http response body back into protobuf")
+			continue
+		}
+
+		// om-core passes every MMF response through, and so does this client.
+		logger.Trace("Forwarding StreamedMmfResponse protobuf")
+		select {
+		case respChan <- respPb:
+		case <-streamCtx.Done():
+			return fmt.Errorf("InvokeMatchmakingFunctions stopped reading results: %w", context.Cause(streamCtx))
+		}
 	}
+
+	// If the caller's context ended (for example the director's per-cycle MMF
+	// deadline) while blocked reading, report that rather than the resulting read
+	// error, so the caller sees its own cancel cause.
+	if ctx.Err() != nil {
+		return fmt.Errorf("InvokeMatchmakingFunctions stopped reading results: %w", context.Cause(ctx))
+	}
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+		logger.Errorf("Error reading stream, closing: %v", err)
+		return fmt.Errorf("error reading InvokeMatchmakingFunctions stream: %w", err)
+	}
+	if streamErr != nil {
+		return streamErr
+	}
+	if decodeErrCount > 0 {
+		return fmt.Errorf("could not decode %d InvokeMatchmakingFunctions stream message(s)", decodeErrCount)
+	}
+	return nil
 }
 
-// Post makes an HTTP request at the given url+path, and a byte buffer of the
-// data to POST.  It attempts to transparently handle TLS if the target server
-// requires it.
-func (rc *RestfulOMGrpcClient) Post(ctx context.Context, logger *logrus.Entry, url string, path string, reqBuf []byte) (*http.Response, error) {
-	// Add the url as a structured logging field when debug logging is enabled
-	postLogger := logger.WithFields(logrus.Fields{
-		"url": url + path,
+// Do makes an HTTP request with the given method at url+path with a byte
+// buffer of the JSON payload. A trailing "/" on url is ignored. On Cloud Run
+// (K_REVISION set), it attaches a cached ID token for the audience url and, if
+// om-core answers 401 Unauthenticated (for example because the token just
+// expired), retries once with a freshly minted token. A 403 is returned as-is,
+// because it means the service account lacks the Cloud Run Invoker role, which
+// a new token will not fix.
+func (rc *RestfulOMGrpcClient) Do(ctx context.Context, method string, url string, path string, reqBuf []byte) (*http.Response, error) {
+	url = strings.TrimSuffix(url, "/")
+	targetURL := url + path
+
+	reqLogger := rc.Log.WithFields(logrus.Fields{
+		"url":    targetURL,
+		"method": method,
 	})
 
-	// Set up our request parameters
-	req, err := http.NewRequestWithContext(
-		ctx,                     // Context
-		http.MethodPost,         // HTTP verb
-		url+path,                // RESTful OM2 path
-		bytes.NewReader(reqBuf), // JSON-marshalled protobuf request message
-	)
-	if err != nil {
-		postLogger.Errorf("cannot create http request with context")
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	postLogger.Trace("Header set, request created")
-
-	if os.Getenv("K_REVISION") != "" { // Running on Cloud Run, get GCP SA token
-		if rc.tokenSource == nil {
-			// Create a TokenSource if none exists.
-			rc.tokenSource, err = idtoken.NewTokenSource(ctx, url)
-			if err != nil {
-				err = fmt.Errorf("Cloud Run service account authentication requires token source, but couldn't get one. idtoken.NewTokenSource: %v", err)
-				return nil, err
-			}
-		}
-
-		// Retrieve an identity token. Will reuse tokens until refresh needed.
-		token, err := rc.tokenSource.Token()
+	sendOnce := func(tok *oauth2.Token) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(
+			ctx,
+			method,
+			targetURL,
+			bytes.NewReader(reqBuf),
+		)
 		if err != nil {
-			err = fmt.Errorf("Cloud Run service account authentication requires a token, but couldn't get one. TokenSource.Token: %v", err)
+			reqLogger.WithFields(logrus.Fields{
+				"error": err,
+			}).Error("cannot create http request with context")
 			return nil, err
 		}
-		token.SetAuthHeader(req)
-	}
-
-	// Log all request headers if using trace logging (slow)
-	if logrus.IsLevelEnabled(logrus.TraceLevel) {
-		headerFields := logrus.Fields{}
-		for key, value := range req.Header {
-			headerFields[key] = value
+		req.Header.Set("Content-Type", "application/json")
+		if tok != nil {
+			req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		}
-		postLogger.WithFields(headerFields).Debug("Prepared Headers")
+
+		reqLogger.Trace("Header set, request created")
+
+		if rc.Log.IsLevelEnabled(logrus.TraceLevel) {
+			headerFields := make(logrus.Fields, len(req.Header))
+			for key, value := range req.Header {
+				if strings.EqualFold(key, "Authorization") {
+					headerFields[key] = "REDACTED"
+				} else {
+					headerFields[key] = value
+				}
+			}
+			reqLogger.WithFields(headerFields).Trace("Prepared Headers")
+		}
+
+		resp, err := rc.Client.Do(req)
+		if err != nil {
+			reqLogger.WithFields(logrus.Fields{
+				"error": err,
+			}).Error("cannot execute http request")
+			return nil, err
+		}
+		return resp, nil
 	}
 
-	// Send request
-	resp, err := rc.Client.Do(req)
+	if rc.Cfg.GetString("K_REVISION") == "" {
+		return sendOnce(nil)
+	}
+
+	tok, entry, err := rc.tokenCache.lookup(ctx, url)
 	if err != nil {
-		postLogger.WithFields(logrus.Fields{
-			"error": err,
-		}).Error("cannot execute http request")
 		return nil, err
 	}
-	return resp, err
+
+	resp, err := sendOnce(tok)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
+	}
+
+	if resp.Body != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	refreshedToken, err := rc.tokenCache.refresh(ctx, url, entry)
+	if err != nil {
+		return nil, err
+	}
+
+	return sendOnce(refreshedToken)
+}
+
+// Post makes an HTTP POST request at url+path with a byte buffer of the JSON
+// payload. See Do for Cloud Run authentication and 401 refresh behavior.
+func (rc *RestfulOMGrpcClient) Post(ctx context.Context, url string, path string, reqBuf []byte) (*http.Response, error) {
+	return rc.Do(ctx, http.MethodPost, url, path, reqBuf)
 }
 
 // readAllBody is a simple helper function to make sure an HTTP body is completely read and closed.
 func readAllBody(resp http.Response, logger *logrus.Entry) ([]byte, error) {
-	// Get results
 	body, err := io.ReadAll(resp.Body)
 	defer resp.Body.Close()
 	if err != nil {
@@ -455,33 +940,33 @@ func readAllBody(resp http.Response, logger *logrus.Entry) ([]byte, error) {
 	return body, err
 }
 
-// ValidateConnection can be used to check that the RestfulOMGrpcClient can
-// send requests to the provide Open Match URL
-func (rc *RestfulOMGrpcClient) ValidateConnection(ctx context.Context, url string) error {
+// ValidateConnection checks that the RestfulOMGrpcClient can reach and authenticate
+// to the Open Match server by sending an empty ActivateTicketsRequest to /tickets:activate.
+func (rc *RestfulOMGrpcClient) ValidateConnection(ctx context.Context, url ...string) error {
+	// Bound the check so startup cannot hang on an unreachable om-core.
+	ctx, cancel := context.WithTimeout(ctx, rc.requestTimeout())
+	defer cancel()
 
-	// Make a dummy ticket that will immediately expire and matches no filters.
-	buf, err := protojson.Marshal(&pb.CreateTicketRequest{
-		Ticket: &pb.Ticket{ExpirationTime: timestamppb.Now()},
-	})
-	// Try to create the dummy ticket.
-	resp, err := rc.Post(ctx,
-		rc.Log.WithFields(logrus.Fields{
-			"operation": "proxy_ValidateConnection",
-		}),
-		url, "/", buf)
-	if resp != nil {
-		resp.Body.Close()
+	reqPb, err := protojson.Marshal(&pb.ActivateTicketsRequest{})
+	if err != nil {
+		return err
 	}
-	return err
-}
 
-// syncMapDump can be uncommented and called to see the contents of a sync.Map
-// when debugging.
-//func syncMapDump(sm *sync.Map) map[string]interface{} {
-//	out := map[string]interface{}{}
-//	sm.Range(func(key, value interface{}) bool {
-//		out[fmt.Sprint(key)] = value
-//		return true
-//	})
-//	return out
-//}
+	targetURL := rc.Cfg.GetString("OM_CORE_ADDR")
+	if len(url) > 0 && url[0] != "" {
+		targetURL = url[0]
+	}
+
+	resp, err := rc.Post(ctx, targetURL, "/tickets:activate", reqPb)
+	if err != nil {
+		return err
+	}
+	if resp.Body != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusBadRequest {
+		return nil
+	}
+	return fmt.Errorf("ValidateConnection failed with HTTP status %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
+}
